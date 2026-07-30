@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+
+# Snakemake
+.snakemake/
+
+# Workflow artifacts
+data/results/
+
+# Environment
+.env
+
+# IDE
+.vscode/
+.idea/
