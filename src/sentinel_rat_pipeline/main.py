@@ -11,8 +11,6 @@ from sentinel_rat_pipeline.scripts.persist_results import delete_result, persist
 from sentinel_rat_pipeline.scripts.run_analysis import run_analysis_remote
 from sentinel_rat_pipeline.scripts.watch_inputs import start_watch
 
-import time
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -43,8 +41,7 @@ def on_new_image(image_path: str) -> None:
         logger.error("Analysis failed for %s: %s", host_relative, exc)
         return
     try:
-        time_id = time.strftime("%Y%m%d%H%M%S")
-        persist_results(result, detection_id=time_id)
+        persist_results(host_relative, result)
         logger.info("Persisted result for %s", host_relative)
     except Exception as exc:
         logger.error("Persistence failed for %s: %s", host_relative, exc)
