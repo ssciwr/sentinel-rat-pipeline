@@ -28,6 +28,7 @@ each with zero or more species classifications)::
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 from dashboard.db.data_model import (
@@ -38,8 +39,12 @@ from dashboard.db.data_model import (
     SpeciesClassification,
     Taxonomy,
 )
-from sqlalchemy import create_engine, select  # type: ignore[import-untyped]
-from sqlalchemy.orm import Session  # type: ignore[import-untyped]
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session
+
+from datetime import datetime, timezone
+
+import exifread
 
 from sentinel_rat_pipeline.config import settings
 
@@ -84,7 +89,11 @@ def _get_or_create_ml_model(session: Session, model_info: dict, task: str) -> ML
     ml_model = session.scalars(
         select(MLModel).where(
             MLModel.name == name,
-            MLModel.version.is_(None) if version is None else MLModel.version == version,
+            (
+                MLModel.version.is_(None)
+                if version is None
+                else MLModel.version == version
+            ),
             MLModel.task == task,
         )
     ).first()
@@ -93,7 +102,7 @@ def _get_or_create_ml_model(session: Session, model_info: dict, task: str) -> ML
             name=name,
             version=version,
             task=task,
-            description=model_info.get("description"),
+            description=model_info.get("description", "Added by sentinel-rat-pipeline"),
         )
         session.add(ml_model)
     return ml_model
@@ -105,7 +114,11 @@ def _get_or_create_taxonomy(session: Session, classification: dict) -> Taxonomy:
     taxonomy = session.scalars(
         select(Taxonomy).where(
             Taxonomy.genus == genus,
-            Taxonomy.species.is_(None) if species is None else Taxonomy.species == species,
+            (
+                Taxonomy.species.is_(None)
+                if species is None
+                else Taxonomy.species == species
+            ),
         )
     ).first()
     if taxonomy is None:
@@ -114,6 +127,60 @@ def _get_or_create_taxonomy(session: Session, classification: dict) -> Taxonomy:
         )
         session.add(taxonomy)
     return taxonomy
+
+
+def _get_captured_time(image_path: str) -> datetime | None:
+    """Extract the capture time from the image file name, if present.
+    Otherwise, try to read the EXIF data from the image file.
+
+    Expected filename format: [<camera_name>_]image_<YYYYMMDD>T<HHMMSS>Z.<ext>
+    e.g. hdcamera_image_20260728T170840Z.jpg or image_20260728T170840Z.jpg
+    """
+
+    stem = Path(image_path).stem
+    match = re.search(r"(?:^|_)image_(\d{8}T\d{6}Z)$", stem)
+    if match:
+        try:
+            captured_time = datetime.strptime(match.group(1), "%Y%m%dT%H%M%SZ")
+            return captured_time.replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass  # invalid date values, fall back to EXIF
+
+    try:
+        with open(image_path, "rb") as f:
+            tags = exifread.process_file(f, details=False)
+    except Exception as e:
+        logger.warning("Failed to read EXIF data from %s: %s", image_path, e)
+        return None
+
+    raw = tags.get("EXIF DateTimeOriginal") or tags.get("Image DateTime")
+    if raw is None:
+        logger.warning(
+            "No EXIF DateTimeOriginal or Image DateTime found in %s", image_path
+        )
+        return None
+
+    try:
+        captured_time = datetime.strptime(str(raw), "%Y:%m:%d %H:%M:%S")
+    except ValueError:
+        logger.warning("Invalid EXIF date format in %s: %s", image_path, raw)
+        return None
+
+    # add offset time if available
+    offset_raw = tags.get("EXIF OffsetTimeOriginal")
+    if offset_raw is not None:
+        try:
+            captured_time = datetime.strptime(
+                f"{captured_time:%Y-%m-%d %H:%M:%S}{str(offset_raw).strip()}",
+                "%Y-%m-%d %H:%M:%S%z",
+            ).astimezone(timezone.utc)
+        except ValueError:
+            pass
+
+    # no (valid) offset: assume the camera clock is set to UTC
+    if captured_time.tzinfo is None:
+        captured_time = captured_time.replace(tzinfo=timezone.utc)
+    return captured_time
 
 
 def persist_results(image_path: str, result: dict) -> int:
@@ -126,9 +193,16 @@ def persist_results(image_path: str, result: dict) -> int:
     with Session(engine) as session, session.begin():
         camera = _get_camera(session, camera_name_from_path(image_path))
 
+        image_captured_at = _get_captured_time(image_path)
+        if image_captured_at is None:
+            # use the current time if we can't determine the capture time
+            image_captured_at = datetime.now(timezone.utc)
+
         image_capture = ImageCapture(
             camera_id=camera.id,
             image_path=image_path,
+            captured_at=image_captured_at,
+            uploaded_at=datetime.now(timezone.utc),
             location=camera.location,  # current location of the camera
         )
         session.add(image_capture)

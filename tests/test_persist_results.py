@@ -1,5 +1,8 @@
 """Tests for persist_results helper."""
 
+import struct
+from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -17,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from sentinel_rat_pipeline.config import Settings
 from sentinel_rat_pipeline.scripts.persist_results import (
+    _get_captured_time,
     camera_name_from_path,
     delete_result,
     persist_results,
@@ -65,6 +69,141 @@ def test_camera_name_from_path_empty() -> None:
         camera_name_from_path("_20260730.jpg")
 
 
+def _pack_ifd(entries: list[tuple[int, int, int, bytes]], offset: int) -> bytes:
+    """Pack a little-endian TIFF IFD that starts at ``offset`` in the TIFF block.
+
+    Each entry is (tag, type, count, value bytes); values over 4 bytes are
+    stored after the IFD and referenced by offset.
+    """
+    # 2 bytes for entry count, 12 bytes per entry, 4 bytes for next IFD pointer
+    data_offset = offset + 2 + 12 * len(entries) + 4
+    ifd = struct.pack("<H", len(entries))
+    data = b""
+    for tag, type_, count, value in sorted(entries):
+        if len(value) <= 4:
+            ifd += struct.pack("<HHI", tag, type_, count) + value.ljust(4, b"\0")
+        else:
+            ifd += struct.pack("<HHII", tag, type_, count, data_offset + len(data))
+            data += value
+    return ifd + struct.pack("<I", 0) + data
+
+
+def _write_exif_jpeg(
+    path: Path,
+    *,
+    datetime_original: str | None = None,
+    offset_time_original: str | None = None,
+    image_datetime: str | None = None,
+) -> Path:
+    """Write a minimal JPEG whose only content is an EXIF APP1 segment."""
+
+    def ascii_entry(tag: int, text: str) -> tuple[int, int, int, bytes]:
+        value = text.encode() + b"\0"
+        return (tag, 2, len(value), value)
+
+    exif_entries = []
+    if datetime_original:
+        exif_entries.append(ascii_entry(0x9003, datetime_original))
+    if offset_time_original:
+        exif_entries.append(ascii_entry(0x9011, offset_time_original))
+
+    ifd0_entries = []
+    if image_datetime:
+        ifd0_entries.append(ascii_entry(0x0132, image_datetime))
+    if exif_entries:
+        ifd0_entries.append((0x8769, 4, 1, b"\0\0\0\0"))  # placeholder pointer
+
+    ifd0 = _pack_ifd(ifd0_entries, 8)
+    if exif_entries:
+        exif_offset = 8 + len(ifd0)
+        ifd0_entries[-1] = (0x8769, 4, 1, struct.pack("<I", exif_offset))
+        ifd0 = _pack_ifd(ifd0_entries, 8) + _pack_ifd(exif_entries, exif_offset)
+
+    app1 = b"Exif\0\0" + b"II*\0" + struct.pack("<I", 8) + ifd0
+    path.write_bytes(
+        b"\xff\xd8\xff\xe1" + struct.pack(">H", len(app1) + 2) + app1 + b"\xff\xd9"
+    )
+    return path
+
+
+@pytest.mark.parametrize(
+    "image_path",
+    [
+        "image_20260728T170840Z.jpg",
+        "hdcamera_image_20260728T170840Z.jpg",
+        "/data/samples/image_20260728T170840Z.jpg",
+    ],
+)
+def test_get_captured_time_from_filename(image_path: str) -> None:
+    assert _get_captured_time(image_path) == datetime(
+        2026, 7, 28, 17, 8, 40, tzinfo=timezone.utc
+    )
+
+
+@pytest.mark.parametrize(
+    ("exif", "expected"),
+    [
+        (
+            {
+                "datetime_original": "2026:07:28 19:08:40",
+                "offset_time_original": "+02:00",
+            },
+            datetime(2026, 7, 28, 17, 8, 40, tzinfo=timezone.utc),
+        ),
+        (
+            {"datetime_original": "2026:07:28 17:08:40"},
+            datetime(2026, 7, 28, 17, 8, 40, tzinfo=timezone.utc),
+        ),
+        (
+            {"datetime_original": "2026:07:28 17:08:40", "offset_time_original": "bad"},
+            datetime(2026, 7, 28, 17, 8, 40, tzinfo=timezone.utc),
+        ),
+        (
+            {"image_datetime": "2026:07:28 17:08:40"},
+            datetime(2026, 7, 28, 17, 8, 40, tzinfo=timezone.utc),
+        ),
+        (
+            {
+                "datetime_original": "2026:07:28 17:08:40",
+                "image_datetime": "2026:01:01 00:00:00",
+            },
+            datetime(2026, 7, 28, 17, 8, 40, tzinfo=timezone.utc),
+        ),
+        ({"datetime_original": "2026-07-28T17:08:40"}, None),
+        ({}, None),
+    ],
+    ids=[
+        "with-offset",
+        "no-offset",
+        "invalid-offset",
+        "image-datetime-fallback",
+        "original-preferred",
+        "invalid-format",
+        "no-dates",
+    ],
+)
+def test_get_captured_time_from_exif(
+    tmp_path: Path, exif: dict, expected: datetime | None
+) -> None:
+    image = _write_exif_jpeg(tmp_path / "CAM01.jpg", **exif)
+    assert _get_captured_time(str(image)) == expected
+
+
+def test_get_captured_time_invalid_filename_date_falls_back_to_exif(
+    tmp_path: Path,
+) -> None:
+    image = _write_exif_jpeg(
+        tmp_path / "image_20261399T170840Z.jpg", datetime_original="2026:07:28 17:08:40"
+    )
+    assert _get_captured_time(str(image)) == datetime(
+        2026, 7, 28, 17, 8, 40, tzinfo=timezone.utc
+    )
+
+
+def test_get_captured_time_missing_file() -> None:
+    assert _get_captured_time("does/not/exist.jpg") is None
+
+
 def test_persist_results_unknown_camera(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "sentinel_rat_pipeline.scripts.persist_results.settings",
@@ -94,7 +233,9 @@ def test_persist_results_unknown_camera(monkeypatch: pytest.MonkeyPatch) -> None
 def db_url():
     testcontainers = pytest.importorskip("testcontainers.community.postgres")
     try:
-        container = testcontainers.PostgresContainer("postgis/postgis:17-3.5", driver="psycopg")
+        container = testcontainers.PostgresContainer(
+            "postgis/postgis:17-3.5", driver="psycopg"
+        )
         container.start()
     except Exception as exc:
         pytest.skip(f"Docker not available: {exc}")
