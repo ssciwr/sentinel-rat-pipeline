@@ -17,6 +17,13 @@ logger = logging.getLogger(__name__)
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 
+# A file counts as fully copied once its mtime is unchanged for STABLE_CHECKS
+# polls, STABLE_INTERVAL seconds apart. Give up if the file stays missing for
+# STABLE_TIMEOUT seconds (e.g. it was removed before it became stable).
+STABLE_CHECKS = 3
+STABLE_INTERVAL = 0.5
+STABLE_TIMEOUT = 300.0
+
 # Dedup: src_path -> mtime when it was first queued
 _SEEN: dict[str, float] = {}
 _seen_lock = threading.Lock()
@@ -30,20 +37,24 @@ def _is_image(src_path: str) -> bool:
 def _wait_for_stable_file(src_path: str, callback: Callable[[str], None]) -> None:
     """Poll mtime until the file stops changing (copy is complete)."""
 
-    STABLE_CHECKS = 3
-    STABLE_INTERVAL = 0.5
-
+    deadline = time.monotonic() + STABLE_TIMEOUT
     last_mtime: float | None = None
     stable_count = 0
     while stable_count < STABLE_CHECKS:
         try:
             mtime = Path(src_path).stat().st_mtime
         except OSError:
+            if time.monotonic() > deadline:
+                logger.warning(
+                    "watchdog: %s missing for %ss, skipping", src_path, STABLE_TIMEOUT
+                )
+                return
             stable_count = 0
             last_mtime = None
             time.sleep(STABLE_INTERVAL)
             continue
 
+        deadline = time.monotonic() + STABLE_TIMEOUT
         if mtime == last_mtime:
             stable_count += 1
         else:
