@@ -21,6 +21,7 @@ dependencies = [
     "python-dotenv>=1.0.1",
     "watchdog>=4.0.0",
     "sentinel-rat-dashboard @ git+https://github.com/ssciwr/sentinel-rat-dashboard.git@main",
+    "exifread>=3.5.1",
 ]
 
 [project.optional-dependencies]
@@ -31,11 +32,15 @@ dev = [
 ]
 
 [build-system]
-requires = ["setuptools>=69.0"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.hatch.build.targets.wheel]
+packages = ["src/sentinel_rat_pipeline"]
+
+# needed because sentinel-rat-dashboard is installed from a git URL
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
