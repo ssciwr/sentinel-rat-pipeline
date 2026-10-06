@@ -226,6 +226,9 @@ def persist_results(image_path: str, result: dict) -> int:
                 bbox=det["bbox"],
                 detected_class=det["detected_class"],
             )
+            # SQLAlchemy 2.0 doesn't cascade into the session via backrefs,
+            # so setting image_capture= alone won't persist the detection
+            session.add(object_detection)
             for clas in det.get("classifications", []):
                 object_detection.species_classifications.append(
                     SpeciesClassification(
