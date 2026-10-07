@@ -20,9 +20,11 @@ from sqlalchemy.orm import Session
 
 from sentinel_rat_pipeline.config import Settings
 from sentinel_rat_pipeline.scripts.persist_results import (
+    DEFAULT_MODEL_DESCRIPTION,
     _get_captured_time,
     camera_name_from_path,
     delete_result,
+    existing_image_paths,
     persist_results,
 )
 
@@ -212,6 +214,7 @@ def test_persist_results_unknown_camera(monkeypatch: pytest.MonkeyPatch) -> None
     mock_session = MagicMock()
     mock_session.__enter__.return_value = mock_session
     mock_session.scalars.return_value.all.return_value = []
+    mock_session.scalar.return_value = None  # image not stored yet
 
     with (
         patch("sentinel_rat_pipeline.scripts.persist_results.create_engine"),
@@ -322,3 +325,49 @@ def test_delete_result_cascades(db_settings) -> None:
     with Session(db_settings) as session:
         for table in (ImageCapture, ObjectDetection, SpeciesClassification):
             assert session.scalar(select(func.count()).select_from(table)) == 0
+
+
+def test_persist_results_skips_already_stored_image(db_settings) -> None:
+    image_id = persist_results("CAM01_20260730_115638.jpg", RESULT)
+
+    assert persist_results("CAM01_20260730_115638.jpg", RESULT) == image_id
+    with Session(db_settings) as session:
+        assert session.scalar(select(func.count()).select_from(ImageCapture)) == 1
+        assert session.scalar(select(func.count()).select_from(ObjectDetection)) == 2
+
+
+def test_existing_image_paths(db_settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    # force several lookup queries
+    monkeypatch.setattr(
+        "sentinel_rat_pipeline.scripts.persist_results.LOOKUP_CHUNK_SIZE", 1
+    )
+    persist_results("CAM01_a.jpg", {"detections": []})
+    persist_results("CAM01_b.jpg", {"detections": []})
+
+    assert existing_image_paths(["CAM01_a.jpg", "CAM01_b.jpg", "CAM01_c.jpg"]) == {
+        "CAM01_a.jpg",
+        "CAM01_b.jpg",
+    }
+    assert existing_image_paths([]) == set()
+
+
+@pytest.mark.parametrize(
+    ("model_info", "expected"),
+    [
+        ({"name": "m", "version": "1"}, DEFAULT_MODEL_DESCRIPTION),
+        ({"name": "m", "version": "1", "description": None}, DEFAULT_MODEL_DESCRIPTION),
+        ({"name": "m", "version": "1", "description": "custom"}, "custom"),
+    ],
+    ids=["missing", "null", "given"],
+)
+def test_persist_results_ml_model_description(
+    db_settings, model_info: dict, expected: str
+) -> None:
+    result = {
+        "detection_model": model_info,
+        "detections": [{**RESULT["detections"][0], "classifications": []}],
+    }
+    persist_results("CAM01_20260730_115638.jpg", result)
+
+    with Session(db_settings) as session:
+        assert session.scalars(select(MLModel.description)).one() == expected

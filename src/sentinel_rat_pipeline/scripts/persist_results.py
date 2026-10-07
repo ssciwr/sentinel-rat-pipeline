@@ -1,7 +1,9 @@
 """Save analysis results to PostgreSQL using the dashboard's data model.
 
-Expected ML service response (one entry in ``detections`` per detected object,
-each with zero or more species classifications)::
+The ML service answers a batch request with ``{"results": [...]}``; each
+entry is the result for one image and is persisted on its own. Expected
+per-image result (one entry in ``detections`` per detected object, each with
+zero or more species classifications)::
 
     {
         "image_path": "CAM01_20260730_115638.jpg",
@@ -49,6 +51,12 @@ import exifread
 from sentinel_rat_pipeline.config import settings
 
 logger = logging.getLogger(__name__)
+
+# stored for ML models whose response carries no description
+DEFAULT_MODEL_DESCRIPTION = "Added by sentinel-rat-pipeline"
+
+# max number of paths per "IN (...)" query when looking up stored images
+LOOKUP_CHUNK_SIZE = 1000
 
 # image files are named "<camera_name>_<anything>.<ext>", e.g. "CAM01_20260730_115638.jpg"
 CAMERA_NAME_SEPARATOR = "_"
@@ -102,7 +110,8 @@ def _get_or_create_ml_model(session: Session, model_info: dict, task: str) -> ML
             name=name,
             version=version,
             task=task,
-            description=model_info.get("description", "Added by sentinel-rat-pipeline"),
+            # the ML service may send "description": null, so fall back on falsy too
+            description=model_info.get("description") or DEFAULT_MODEL_DESCRIPTION,
         )
         session.add(ml_model)
     return ml_model
@@ -183,14 +192,40 @@ def _get_captured_time(image_path: str) -> datetime | None:
     return captured_time
 
 
+def existing_image_paths(image_paths: list[str]) -> set[str]:
+    """Return the subset of ``image_paths`` already stored in image_capture."""
+
+    engine = create_engine(settings.database_url)
+    found: set[str] = set()
+    with Session(engine) as session:
+        for start in range(0, len(image_paths), LOOKUP_CHUNK_SIZE):
+            chunk = image_paths[start : start + LOOKUP_CHUNK_SIZE]
+            found.update(
+                session.scalars(
+                    select(ImageCapture.image_path).where(
+                        ImageCapture.image_path.in_(chunk)
+                    )
+                ).all()
+            )
+    return found
+
+
 def persist_results(image_path: str, result: dict) -> int:
     """Store an image and its detections/classifications in one transaction.
 
-    Returns the id of the new image_capture row.
+    Returns the id of the new image_capture row. If the image is already
+    stored, nothing is written and the id of the existing row is returned.
     """
 
     engine = create_engine(settings.database_url)
     with Session(engine) as session, session.begin():
+        existing_id = session.scalar(
+            select(ImageCapture.id).where(ImageCapture.image_path == image_path)
+        )
+        if existing_id is not None:
+            logger.warning("Image %s is already stored, skipping", image_path)
+            return existing_id
+
         camera = _get_camera(session, camera_name_from_path(image_path))
 
         image_captured_at = _get_captured_time(image_path)
