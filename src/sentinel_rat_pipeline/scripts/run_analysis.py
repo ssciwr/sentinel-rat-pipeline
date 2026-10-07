@@ -12,17 +12,6 @@ from sentinel_rat_pipeline.config import settings
 logger = logging.getLogger(__name__)
 
 
-def run_analysis(image_path: str) -> dict:
-    # TODO: replace with real ML pipeline call
-    logger.info("Analyzing %s", image_path)
-    return {
-        "image_path": image_path,
-        "animals_detected": 0,
-        "species": {},
-        "confidence": 0.0,
-    }
-
-
 def run_analysis_remote(image_path: str, retries: int = 5, delay: float = 1.0) -> dict:
     url = f"{settings.ml_pipeline_url.rstrip('/')}/api/v1/analyze"
     payload = {"image_path": image_path}
