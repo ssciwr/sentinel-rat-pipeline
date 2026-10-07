@@ -7,6 +7,10 @@ WORKDIR /workflow
 
 ENV PYTHONPATH=/workflow/src
 
+# git is needed to install sentinel-rat-dashboard (shared ORM models) from GitHub
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY workflow/ ./workflow/
 COPY src/ ./src/
 COPY Snakefile .
