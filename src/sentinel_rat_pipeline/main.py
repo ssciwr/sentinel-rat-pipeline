@@ -129,6 +129,10 @@ def main() -> None:
     logger.info("Watch folder: %s", watch_path)
     logger.info("ML service: %s", settings.ml_pipeline_url)
     logger.info("Database: %s", settings.database_url)
+    logger.info("Batch window: %ss", settings.batch_window_seconds)
+    logger.info("Max batch size: %s", settings.max_batch_size)
+    logger.info("Process backlog: %s", settings.process_backlog)
+    logger.info("Force delete images in DB: %s", settings.force_delete_image_in_db)
 
     if not settings.process_backlog:
         logger.info("Skipping existing images (PROCESS_BACKLOG is disabled)")
