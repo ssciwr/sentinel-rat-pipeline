@@ -107,3 +107,33 @@ is stored as:
 | 2 | Rattus | norvegicus | brown rat |
 
 When an image is deleted from the watch folder, its `image_capture` row is deleted together with its detections, classifications and corrections (*to be re-considered later to keep a history of deleted images*).
+
+## Daily analysis
+
+`sentinel_rat_pipeline.daily_analysis` aggregates the stored detections per day, camera and species into the `daily_analysis_result` table, using `compute_daily_results` of [sentinel-rat-dashboard](https://github.com/ssciwr/sentinel-rat-dashboard) (see its README for the aggregation rules). It runs as its own service (`daily-analysis` in `sentinel-rat/docker-compose.yml`) with the pipeline image, so it doesn't depend on the watcher.
+
+```bash
+# scheduler: aggregate every night at ANALYSIS_TIME, and once at startup
+python -m sentinel_rat_pipeline.daily_analysis
+# aggregate all past days that have images not aggregated yet, then exit
+python -m sentinel_rat_pipeline.daily_analysis --once
+# aggregate one day, then exit; --recompute rebuilds it from all its images
+python -m sentinel_rat_pipeline.daily_analysis --date 2026-10-01 --recompute
+```
+
+Each run aggregates every day before today that still has images not aggregated yet (`tobe_deleted` is `False`): yesterday, days missed while the scheduler was not running, and days with images that arrived late (they are merged into the existing results). Corrections of already aggregated images are applied by the dashboard as soon as they are saved, so the scheduler doesn't have to look for them.
+
+Settings (environment variables):
+
+* `DATABASE_URL`
+* `ANALYSIS_TZ`: timezone in which a day starts and ends (default `Asia/Colombo`); must match the dashboard's
+* `ANALYSIS_TIME`: local time of the nightly run (default `00:00`)
+
+To run it once by hand with Docker, on the network of the `sentinel-rat` stack:
+
+```bash
+docker run --rm --network sentinel-rat_sentinel-rat-net \
+  -e DATABASE_URL=postgresql+psycopg://sentinel_user:sentinel_pass@db:5432/sentinel_db \
+  -e ANALYSIS_TZ=Asia/Colombo \
+  sentinel-rat-pipeline:local python -m sentinel_rat_pipeline.daily_analysis --once
+```
