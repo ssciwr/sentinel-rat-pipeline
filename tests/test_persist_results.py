@@ -318,33 +318,31 @@ def test_persist_results_unknown_camera_rolls_back(db_settings) -> None:
         assert session.scalar(select(func.count()).select_from(ImageCapture)) == 0
 
 
-def _mark_moved(engine, image_id: int) -> None:
+def _mark_tobe_deleted(engine, image_id: int) -> None:
     with Session(engine) as session, session.begin():
-        image = session.get(ImageCapture, image_id)
-        image.tobe_deleted = True
-        image.is_moved = True
+        session.get(ImageCapture, image_id).tobe_deleted = True
 
 
-def test_delete_result_cascades(db_settings) -> None:
+def test_delete_result_marks_tobe_deleted_image_as_moved(db_settings) -> None:
     image_id = persist_results("CAM01_20260730_115638.jpg", RESULT)
-    _mark_moved(db_settings, image_id)
+    _mark_tobe_deleted(db_settings, image_id)
     delete_result("CAM01_20260730_115638.jpg")
 
     with Session(db_settings) as session:
-        for table in (ImageCapture, ObjectDetection, SpeciesClassification):
-            assert session.scalar(select(func.count()).select_from(table)) == 0
-
-
-def test_delete_result_keeps_image_not_moved(db_settings) -> None:
-    persist_results("CAM01_20260730_115638.jpg", RESULT)
-    delete_result("CAM01_20260730_115638.jpg")
-
-    with Session(db_settings) as session:
-        assert session.scalar(select(func.count()).select_from(ImageCapture)) == 1
+        assert session.get(ImageCapture, image_id).is_moved is True
         assert session.scalar(select(func.count()).select_from(ObjectDetection)) == 2
 
 
-def test_delete_result_force_deletes_image_not_moved(
+def test_delete_result_ignores_image_not_tobe_deleted(db_settings) -> None:
+    image_id = persist_results("CAM01_20260730_115638.jpg", RESULT)
+    delete_result("CAM01_20260730_115638.jpg")
+
+    with Session(db_settings) as session:
+        assert session.get(ImageCapture, image_id).is_moved is not True
+        assert session.scalar(select(func.count()).select_from(ObjectDetection)) == 2
+
+
+def test_delete_result_force_deletes_image_not_tobe_deleted(
     db_settings, db_url, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
