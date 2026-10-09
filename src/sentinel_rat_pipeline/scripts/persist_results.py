@@ -285,13 +285,18 @@ def persist_results(image_path: str, result: dict) -> int:
 
 def delete_result(image_path: str) -> None:
     """Delete image_capture rows for an image along with their detections,
-    classifications, and corrections (via ORM cascades)."""
+    classifications, and corrections (via ORM cascades).
+
+    Only rows marked with ``is_moved`` are deleted, unless
+    ``settings.force_delete_image`` is set.
+    """
 
     engine = create_engine(settings.database_url)
     with Session(engine) as session, session.begin():
-        images = session.scalars(
-            select(ImageCapture).where(ImageCapture.image_path == image_path)
-        ).all()
+        statement = select(ImageCapture).where(ImageCapture.image_path == image_path)
+        if not settings.force_delete_image:
+            statement = statement.where(ImageCapture.is_moved.is_(True))
+        images = session.scalars(statement).all()
         for image in images:
             session.delete(image)
         logger.info("Deleted %s image_capture row(s) for %s", len(images), image_path)

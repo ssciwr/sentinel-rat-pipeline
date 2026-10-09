@@ -318,7 +318,39 @@ def test_persist_results_unknown_camera_rolls_back(db_settings) -> None:
         assert session.scalar(select(func.count()).select_from(ImageCapture)) == 0
 
 
+def _mark_moved(engine, image_id: int) -> None:
+    with Session(engine) as session, session.begin():
+        image = session.get(ImageCapture, image_id)
+        image.tobe_deleted = True
+        image.is_moved = True
+
+
 def test_delete_result_cascades(db_settings) -> None:
+    image_id = persist_results("CAM01_20260730_115638.jpg", RESULT)
+    _mark_moved(db_settings, image_id)
+    delete_result("CAM01_20260730_115638.jpg")
+
+    with Session(db_settings) as session:
+        for table in (ImageCapture, ObjectDetection, SpeciesClassification):
+            assert session.scalar(select(func.count()).select_from(table)) == 0
+
+
+def test_delete_result_keeps_image_not_moved(db_settings) -> None:
+    persist_results("CAM01_20260730_115638.jpg", RESULT)
+    delete_result("CAM01_20260730_115638.jpg")
+
+    with Session(db_settings) as session:
+        assert session.scalar(select(func.count()).select_from(ImageCapture)) == 1
+        assert session.scalar(select(func.count()).select_from(ObjectDetection)) == 2
+
+
+def test_delete_result_force_deletes_image_not_moved(
+    db_settings, db_url, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "sentinel_rat_pipeline.scripts.persist_results.settings",
+        Settings(database_url=db_url, force_delete_image=True),
+    )
     persist_results("CAM01_20260730_115638.jpg", RESULT)
     delete_result("CAM01_20260730_115638.jpg")
 
