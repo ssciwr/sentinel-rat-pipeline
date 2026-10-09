@@ -284,14 +284,32 @@ def persist_results(image_path: str, result: dict) -> int:
 
 
 def delete_result(image_path: str) -> None:
-    """Delete image_capture rows for an image along with their detections,
-    classifications, and corrections (via ORM cascades)."""
+    """Handle the removal of an image file from the watch folder.
+
+    By default, image_capture rows marked with ``tobe_deleted`` are flagged
+    as ``is_moved``; the rows themselves are kept. If
+    ``settings.force_delete_image_in_db`` is set, all rows for the image are
+    deleted regardless of ``tobe_deleted``, along with their detections,
+    classifications, and corrections (via ORM cascades).
+    """
 
     engine = create_engine(settings.database_url)
     with Session(engine) as session, session.begin():
+        statement = select(ImageCapture).where(ImageCapture.image_path == image_path)
+        if settings.force_delete_image_in_db:
+            images = session.scalars(statement).all()
+            for image in images:
+                session.delete(image)
+            logger.info(
+                "Deleted %s image_capture row(s) for %s", len(images), image_path
+            )
+            return
+
         images = session.scalars(
-            select(ImageCapture).where(ImageCapture.image_path == image_path)
+            statement.where(ImageCapture.tobe_deleted.is_(True))
         ).all()
         for image in images:
-            session.delete(image)
-        logger.info("Deleted %s image_capture row(s) for %s", len(images), image_path)
+            image.is_moved = True
+        logger.info(
+            "Marked %s image_capture row(s) as moved for %s", len(images), image_path
+        )
