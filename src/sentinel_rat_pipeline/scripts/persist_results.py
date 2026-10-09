@@ -288,7 +288,7 @@ def delete_result(image_path: str) -> None:
 
     By default, image_capture rows marked with ``tobe_deleted`` are flagged
     as ``is_moved``; the rows themselves are kept. If
-    ``settings.force_delete_image`` is set, all rows for the image are
+    ``settings.force_delete_image_in_db`` is set, all rows for the image are
     deleted regardless of ``tobe_deleted``, along with their detections,
     classifications, and corrections (via ORM cascades).
     """
@@ -296,7 +296,7 @@ def delete_result(image_path: str) -> None:
     engine = create_engine(settings.database_url)
     with Session(engine) as session, session.begin():
         statement = select(ImageCapture).where(ImageCapture.image_path == image_path)
-        if settings.force_delete_image:
+        if settings.force_delete_image_in_db:
             images = session.scalars(statement).all()
             for image in images:
                 session.delete(image)

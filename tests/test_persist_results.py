@@ -347,7 +347,7 @@ def test_delete_result_force_deletes_image_not_tobe_deleted(
 ) -> None:
     monkeypatch.setattr(
         "sentinel_rat_pipeline.scripts.persist_results.settings",
-        Settings(database_url=db_url, force_delete_image=True),
+        Settings(database_url=db_url, force_delete_image_in_db=True),
     )
     persist_results("CAM01_20260730_115638.jpg", RESULT)
     delete_result("CAM01_20260730_115638.jpg")

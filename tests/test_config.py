@@ -13,10 +13,12 @@ def test_batch_defaults() -> None:
     assert settings.process_backlog is True
 
 
-def test_force_delete_image_defaults_to_false(monkeypatch: pytest.MonkeyPatch) -> None:
-    assert Settings().force_delete_image is False
-    monkeypatch.setenv("FORCE_DELETE_IMAGE", "true")
-    assert Settings().force_delete_image is True
+def test_force_delete_image_in_db_defaults_to_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert Settings().force_delete_image_in_db is False
+    monkeypatch.setenv("FORCE_DELETE_IMAGE_IN_DB", "true")
+    assert Settings().force_delete_image_in_db is True
 
 
 def test_batch_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
