@@ -1,11 +1,13 @@
 """Tests for watch_inputs helper."""
 
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
+from sentinel_rat_pipeline.config import Settings
 from sentinel_rat_pipeline.scripts import watch_inputs
 from sentinel_rat_pipeline.scripts.watch_inputs import (
     ImageBatcher,
@@ -42,6 +44,20 @@ def test_list_images_with_image(tmp_path: Path) -> None:
     (tmp_path / "note.txt").write_text("txt")
     result = list_images(str(tmp_path))
     assert result == [str(tmp_path / "photo.jpg")]
+
+
+def test_list_images_includes_sub_folders(tmp_path: Path) -> None:
+    (tmp_path / "top.jpg").write_text("jpg")
+    (tmp_path / "cam01" / "2026-10").mkdir(parents=True)
+    (tmp_path / "cam01" / "a.jpg").write_text("jpg")
+    (tmp_path / "cam01" / "2026-10" / "b.png").write_text("png")
+    (tmp_path / "cam01" / "dir.jpg").mkdir()  # a folder, not an image
+    result = list_images(str(tmp_path))
+    assert sorted(result) == [
+        str(tmp_path / "cam01" / "2026-10" / "b.png"),
+        str(tmp_path / "cam01" / "a.jpg"),
+        str(tmp_path / "top.jpg"),
+    ]
 
 
 def test_is_image(tmp_path: Path) -> None:
@@ -263,3 +279,34 @@ def test_queue_backlog_waits_for_images_still_being_copied(
     # picked up once the per-file check sees it stable
     _wait_until_called(mock_callback)
     mock_callback.assert_called_once_with([str(image)])
+
+
+def test_start_watch_picks_up_images_in_new_sub_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        watch_inputs,
+        "settings",
+        Settings(watch_folder=str(tmp_path), batch_window_seconds=0.05),
+    )
+    received: list[list[str]] = []
+    watcher = threading.Thread(
+        target=watch_inputs.start_watch, args=(received.append,), daemon=True
+    )
+    watcher.start()
+    time.sleep(0.3)  # let the observer start
+
+    # a camera folder moved in at once, as well as a file in an existing one
+    staged = tmp_path.parent / f"{tmp_path.name}-staged" / "cam02"
+    staged.mkdir(parents=True)
+    (staged / "a.jpg").write_bytes(b"jpg")
+    staged.rename(tmp_path / "cam02")
+    (tmp_path / "cam02" / "b.jpg").write_bytes(b"jpg")
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and sum(map(len, received)) < 2:
+        time.sleep(0.05)
+    assert sorted(p for batch in received for p in batch) == [
+        str((tmp_path / "cam02" / "a.jpg").resolve()),
+        str((tmp_path / "cam02" / "b.jpg").resolve()),
+    ]
