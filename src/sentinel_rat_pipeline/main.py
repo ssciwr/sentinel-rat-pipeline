@@ -8,6 +8,7 @@ from pathlib import Path
 
 from sentinel_rat_pipeline.config import settings
 from sentinel_rat_pipeline.scripts.persist_results import (
+    clear_missing_since,
     delete_result,
     existing_image_paths,
     persist_results,
@@ -81,7 +82,8 @@ def _host_path(image_path: str) -> str | None:
 
 def _unprocessed_images(image_paths: list[str]) -> list[str]:
     """Drop images that are already stored in the database or that are
-    outside the watch folder."""
+    outside the watch folder. Stored images marked missing are back, so their
+    mark is cleared."""
     host_paths = {
         image_path: host_path
         for image_path in image_paths
@@ -90,6 +92,7 @@ def _unprocessed_images(image_paths: list[str]) -> list[str]:
     stored = existing_image_paths(list(host_paths.values()))
     if stored:
         logger.info("Skipping %s image(s) already in the database", len(stored))
+        clear_missing_since(sorted(stored))
     return [path for path, host in host_paths.items() if host not in stored]
 
 

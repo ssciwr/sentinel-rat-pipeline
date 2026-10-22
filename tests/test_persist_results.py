@@ -26,6 +26,7 @@ from sentinel_rat_pipeline.scripts.persist_results import (
     _get_captured_time,
     _resolve_camera,
     camera_folder,
+    clear_missing_since,
     delete_result,
     device_id_from_metadata,
     existing_image_paths,
@@ -336,7 +337,7 @@ def test_persist_results_unknown_camera(monkeypatch: pytest.MonkeyPatch) -> None
     mock_session = MagicMock()
     mock_session.__enter__.return_value = mock_session
     mock_session.scalars.return_value.all.return_value = []
-    mock_session.scalar.return_value = None  # image not stored yet
+    mock_session.scalars.return_value.first.return_value = None  # not stored yet
 
     with (
         patch("sentinel_rat_pipeline.scripts.persist_results.create_engine"),
@@ -498,15 +499,69 @@ def test_delete_result_marks_tobe_deleted_image_as_moved(db_settings) -> None:
         assert session.scalar(select(func.count()).select_from(ObjectDetection)) == 2
 
 
-def test_delete_result_ignores_image_not_tobe_deleted(db_settings) -> None:
+def test_delete_result_marks_image_not_tobe_deleted_as_missing(db_settings) -> None:
     image_id = persist_results(
         "cam01/20260730_115638.jpg", RESULT, "/data/images/cam01/20260730_115638.jpg"
     )
+    before = datetime.now(timezone.utc)
     delete_result("cam01/20260730_115638.jpg")
 
     with Session(db_settings) as session:
-        assert session.get(ImageCapture, image_id).is_moved is not True
+        image = session.get(ImageCapture, image_id)
+        assert image.is_moved is not True
+        assert image.missing_since >= before
         assert session.scalar(select(func.count()).select_from(ObjectDetection)) == 2
+
+
+def test_delete_result_keeps_first_missing_since(db_settings) -> None:
+    image_id = persist_results(
+        "cam01/a.jpg", {"detections": []}, "/data/images/cam01/a.jpg"
+    )
+    delete_result("cam01/a.jpg")
+    with Session(db_settings) as session:
+        first = session.get(ImageCapture, image_id).missing_since
+
+    delete_result("cam01/a.jpg")
+
+    with Session(db_settings) as session:
+        assert session.get(ImageCapture, image_id).missing_since == first
+
+
+def test_persist_results_clears_missing_since_when_image_is_back(db_settings) -> None:
+    image_id = persist_results(
+        "cam01/a.jpg", {"detections": []}, "/data/images/cam01/a.jpg"
+    )
+    delete_result("cam01/a.jpg")
+
+    assert (
+        persist_results("cam01/a.jpg", {"detections": []}, "/data/images/cam01/a.jpg")
+        == image_id
+    )
+    with Session(db_settings) as session:
+        assert session.get(ImageCapture, image_id).missing_since is None
+
+
+def test_clear_missing_since(db_settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    # force several update queries
+    monkeypatch.setattr(
+        "sentinel_rat_pipeline.scripts.persist_results.LOOKUP_CHUNK_SIZE", 1
+    )
+    for name in "abc":
+        persist_results(
+            f"cam01/{name}.jpg", {"detections": []}, f"/data/images/cam01/{name}.jpg"
+        )
+    delete_result("cam01/a.jpg")
+    delete_result("cam01/b.jpg")
+
+    # b stays missing; c was never missing
+    assert clear_missing_since(["cam01/a.jpg", "cam01/c.jpg"]) == 1
+    with Session(db_settings) as session:
+        missing = session.scalars(
+            select(ImageCapture.image_path).where(
+                ImageCapture.missing_since.is_not(None)
+            )
+        ).all()
+    assert missing == ["cam01/b.jpg"]
 
 
 def test_delete_result_force_deletes_image_not_tobe_deleted(

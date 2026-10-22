@@ -43,7 +43,7 @@ from dashboard.db.data_model import (
     SpeciesClassification,
     Taxonomy,
 )
-from sqlalchemy import Engine, create_engine, select
+from sqlalchemy import Engine, create_engine, select, update
 from sqlalchemy.orm import Session
 
 from datetime import datetime, timezone
@@ -275,6 +275,27 @@ def existing_image_paths(image_paths: list[str]) -> set[str]:
     return found
 
 
+def clear_missing_since(image_paths: list[str]) -> int:
+    """Clear ``missing_since`` of stored images whose file is back in the watch
+    folder. Returns the number of rows updated."""
+
+    updated = 0
+    with Session(_engine(settings.database_url)) as session, session.begin():
+        for start in range(0, len(image_paths), LOOKUP_CHUNK_SIZE):
+            chunk = image_paths[start : start + LOOKUP_CHUNK_SIZE]
+            updated += session.execute(
+                update(ImageCapture)
+                .where(
+                    ImageCapture.image_path.in_(chunk),
+                    ImageCapture.missing_since.is_not(None),
+                )
+                .values(missing_since=None)
+            ).rowcount
+    if updated:
+        logger.info("Cleared missing_since of %s image(s) back in the folder", updated)
+    return updated
+
+
 def persist_results(image_path: str, result: dict, file_path: str) -> int:
     """Store an image and its detections/classifications in one transaction.
 
@@ -283,16 +304,21 @@ def persist_results(image_path: str, result: dict, file_path: str) -> int:
     container), for its camera and capture time metadata.
 
     Returns the id of the new image_capture row. If the image is already
-    stored, nothing is written and the id of the existing row is returned.
+    stored, nothing is written and the id of the existing row is returned;
+    if that row was marked missing, the file is back and the mark is cleared.
     """
 
     with Session(_engine(settings.database_url)) as session, session.begin():
-        existing_id = session.scalar(
-            select(ImageCapture.id).where(ImageCapture.image_path == image_path)
-        )
-        if existing_id is not None:
-            logger.warning("Image %s is already stored, skipping", image_path)
-            return existing_id
+        existing = session.scalars(
+            select(ImageCapture).where(ImageCapture.image_path == image_path)
+        ).first()
+        if existing is not None:
+            if existing.missing_since is not None:
+                existing.missing_since = None
+                logger.info("Image %s is back, cleared missing_since", image_path)
+            else:
+                logger.warning("Image %s is already stored, skipping", image_path)
+            return existing.id
 
         camera = _resolve_camera(session, image_path, file_path)
 
@@ -355,10 +381,11 @@ def delete_result(image_path: str) -> None:
     """Handle the removal of an image file from the watch folder.
 
     By default, image_capture rows marked with ``tobe_deleted`` are flagged
-    as ``is_moved``; the rows themselves are kept. If
-    ``settings.force_delete_image_in_db`` is set, all rows for the image are
-    deleted regardless of ``tobe_deleted``, along with their detections,
-    classifications, and corrections (via ORM cascades).
+    as ``is_moved``; other rows were not meant to leave the watch folder, so
+    ``missing_since`` is set (if not set already) and an error is logged. The
+    rows themselves are kept. If ``settings.force_delete_image_in_db`` is set,
+    all rows for the image are deleted regardless of ``tobe_deleted``,
+    along with their detections, classifications, and corrections (via ORM cascades).
     """
 
     with Session(_engine(settings.database_url)) as session, session.begin():
@@ -372,11 +399,19 @@ def delete_result(image_path: str) -> None:
             )
             return
 
-        images = session.scalars(
-            statement.where(ImageCapture.tobe_deleted.is_(True))
-        ).all()
-        for image in images:
-            image.is_moved = True
-        logger.info(
-            "Marked %s image_capture row(s) as moved for %s", len(images), image_path
-        )
+        moved = missing = 0
+        for image in session.scalars(statement).all():
+            if image.tobe_deleted:
+                image.is_moved = True
+                moved += 1
+            elif image.missing_since is None:
+                image.missing_since = datetime.now(timezone.utc)
+                missing += 1
+        logger.info("Marked %s image_capture row(s) as moved for %s", moved, image_path)
+        if missing:
+            logger.error(
+                "Image %s was removed from the watch folder without being marked "
+                "tobe_deleted; marked %s image_capture row(s) as missing",
+                image_path,
+                missing,
+            )

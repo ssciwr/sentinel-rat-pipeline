@@ -112,4 +112,9 @@ is stored as:
 | 1 | Rattus | rattus | black rat |
 | 2 | Rattus | norvegicus | brown rat |
 
-When an image is deleted from the watch folder, its `image_capture` row is deleted together with its detections, classifications and corrections (*to be re-considered later to keep a history of deleted images*).
+When an image is removed from the watch folder, its `image_capture` row is kept:
+
+- if the row is marked `tobe_deleted`, it is marked `is_moved`;
+- otherwise the image was not meant to leave the watch folder: `missing_since` is set to the time of removal and an error is logged. If the image is put back, `missing_since` is cleared again (when the watcher sees it, or at the next startup).
+
+With `FORCE_DELETE_IMAGE_IN_DB=true`, the row is deleted instead, together with its detections, classifications and corrections.

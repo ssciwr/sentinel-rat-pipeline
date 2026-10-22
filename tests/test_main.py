@@ -146,11 +146,15 @@ def test_unprocessed_images_drops_stored_images(
     monkeypatch.setattr(main, "settings", Settings(watch_folder="/data/images"))
     existing = MagicMock(return_value={"a.jpg"})
     monkeypatch.setattr(main, "existing_image_paths", existing)
+    clear_missing = MagicMock()
+    monkeypatch.setattr(main, "clear_missing_since", clear_missing)
 
     remaining = main._unprocessed_images(["/data/images/a.jpg", "/data/images/b.jpg"])
 
     existing.assert_called_once_with(["a.jpg", "b.jpg"])
     assert remaining == ["/data/images/b.jpg"]
+    # a stored image found at startup is in the folder, so it is not missing
+    clear_missing.assert_called_once_with(["a.jpg"])
 
 
 def test_unprocessed_images_drops_images_outside_watch_folder(
@@ -159,11 +163,14 @@ def test_unprocessed_images_drops_images_outside_watch_folder(
     monkeypatch.setattr(main, "settings", Settings(watch_folder="/data/images"))
     existing = MagicMock(return_value=set())
     monkeypatch.setattr(main, "existing_image_paths", existing)
+    clear_missing = MagicMock()
+    monkeypatch.setattr(main, "clear_missing_since", clear_missing)
 
     remaining = main._unprocessed_images(["/elsewhere/a.jpg", "/data/images/b.jpg"])
 
     existing.assert_called_once_with(["b.jpg"])
     assert remaining == ["/data/images/b.jpg"]
+    clear_missing.assert_not_called()
 
 
 def test_to_host_relative_accepts_resolved_watch_folder(
