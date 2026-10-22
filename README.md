@@ -4,7 +4,7 @@ Work in progress...
 
 ## Overview
 
-Snakemake workflow that watches a folder for new images, triggers `sentinel-rat-ml-pipeline` for analysis, and persists results to the PostgreSQL (PostGIS) database.
+Service that watches a folder for new images, triggers `sentinel-rat-ml-pipeline` for analysis, and persists results to the PostgreSQL (PostGIS) database.
 
 ## Run with Docker Compose (recommended)
 
@@ -16,15 +16,16 @@ docker compose up --build
 
 The pipeline will watch `watched-images/` on the host and process new images automatically.
 
-No local installation is needed. The container is built from `condaforge/mambaforge` with a dedicated conda environment that installs Snakemake via `conda install -c bioconda snakemake` and the package dependencies via `pip install -e .`.
+No local installation is needed. The container is built from `python:3.13-slim` and installs the package with `pip install -e .`.
 
 ## Run locally (optional)
 
 ```bash
-conda create -n sentinel-rat-pipe python=3.13 -y
-conda activate sentinel-rat-pipe
-pip install -e .
-snakemake --use-conda -s Snakefile watch analyze persist --cores 1
+uv sync            # or: pip install -e .
+export WATCH_FOLDER_DOCKER=/path/to/watched-images
+export DATABASE_URL=postgresql+psycopg://user:pass@localhost:5432/sentinel_db
+export ML_PIPELINE_URL=http://localhost:8000
+uv run python -m sentinel_rat_pipeline.main
 ```
 
 ## Example workflow

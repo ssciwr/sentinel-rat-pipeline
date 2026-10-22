@@ -574,7 +574,7 @@ wheels = [
 [[package]]
 name = "sentinel-rat-dashboard"
 version = "0.1.0"
-source = { git = "https://github.com/ssciwr/sentinel-rat-dashboard.git?rev=main#f8101f053cca70b1e8421b0e1670403f3e3aaca3" }
+source = { git = "https://github.com/ssciwr/sentinel-rat-dashboard.git?rev=main#d1f9e388986472b9432068c584d8de18e748bb74" }
 dependencies = [
     { name = "geoalchemy2" },
     { name = "sqlalchemy" },

@@ -11,16 +11,10 @@ ENV PYTHONPATH=/workflow/src
 RUN apt-get update && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*
 
-COPY workflow/ ./workflow/
 COPY src/ ./src/
-COPY Snakefile .
 COPY pyproject.toml .
 
-RUN pip install --no-cache-dir snakemake
-
 RUN pip install --no-cache-dir -e .
-
-RUN mkdir -p /workflow/data/results /workflow/data/logs
 
 EXPOSE 8001
 
