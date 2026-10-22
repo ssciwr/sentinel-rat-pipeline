@@ -26,16 +26,23 @@ def on_new_images(image_paths: list[str]) -> None:
     watch folder before passing them downstream so the stored ``image_path``
     matches what an operator sees on the host filesystem. Batches larger than
     ``settings.max_batch_size`` are split and sent to the ML service in chunks.
+    Images outside the watch folder are skipped.
     """
-    host_paths = [_host_path(image_path) for image_path in image_paths]
+    # host-relative path -> container path, which is where the file is read
+    file_paths = {
+        host_path: image_path
+        for image_path in image_paths
+        if (host_path := _host_path(image_path)) is not None
+    }
+    host_paths = list(file_paths)
 
     logger.info("*** on_new_images callback entered: %s image(s) ***", len(host_paths))
     size = settings.max_batch_size
     for start in range(0, len(host_paths), size):
-        _analyze_and_persist(host_paths[start : start + size])
+        _analyze_and_persist(host_paths[start : start + size], file_paths)
 
 
-def _analyze_and_persist(host_paths: list[str]) -> None:
+def _analyze_and_persist(host_paths: list[str], file_paths: dict[str, str]) -> None:
     """Send one chunk to the ML service and persist each of its results."""
     try:
         results = run_analysis_remote(host_paths)
@@ -52,30 +59,34 @@ def _analyze_and_persist(host_paths: list[str]) -> None:
             continue
         # one transaction per image, so a failing image doesn't drop the batch
         try:
-            persist_results(host_path, result)
+            persist_results(host_path, result, file_path=file_paths[host_path])
             logger.info("Persisted result for %s", host_path)
         except Exception as exc:
             logger.error("Persistence failed for %s: %s", host_path, exc)
 
 
-def _host_path(image_path: str) -> str:
-    """Host-relative path of an image, or the full path if it is outside the
-    watch folder."""
+def _host_path(image_path: str) -> str | None:
+    """Host-relative path of an image, or None if it is outside the watch
+    folder (then it has no camera folder and is skipped)."""
     try:
         return _to_host_relative(image_path)
     except ValueError:
-        logger.warning(
-            "Could not make host-relative path for %s (watch_folder=%s), "
-            "storing full container path",
+        logger.error(
+            "Skipping %s: outside the watch folder %s",
             image_path,
             settings.watch_folder,
         )
-        return image_path
+        return None
 
 
 def _unprocessed_images(image_paths: list[str]) -> list[str]:
-    """Drop images that are already stored in the database."""
-    host_paths = {image_path: _host_path(image_path) for image_path in image_paths}
+    """Drop images that are already stored in the database or that are
+    outside the watch folder."""
+    host_paths = {
+        image_path: host_path
+        for image_path in image_paths
+        if (host_path := _host_path(image_path)) is not None
+    }
     stored = existing_image_paths(list(host_paths.values()))
     if stored:
         logger.info("Skipping %s image(s) already in the database", len(stored))

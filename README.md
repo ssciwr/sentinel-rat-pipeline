@@ -4,7 +4,7 @@ Work in progress...
 
 ## Overview
 
-Service that watches a folder for new images, triggers `sentinel-rat-ml-pipeline` for analysis, and persists results to the PostgreSQL (PostGIS) database.
+Service that watches a folder (and its per-camera sub-folders) for new images, triggers `sentinel-rat-ml-pipeline` for analysis, and persists results to the PostgreSQL (PostGIS) database.
 
 ## Run with Docker Compose (recommended)
 
@@ -30,10 +30,10 @@ uv run python -m sentinel_rat_pipeline.main
 
 ## Example workflow
 
-Given `watched-images/CAM01_image_20260728T170840Z.jpg`:
+Given `watched-images/CAM01/image_20260728T170840Z.jpg`:
 
 ### 1. Watch
-`watchdog` detects the new image. The first new image opens a 1-minute window (configurable via `BATCH_WINDOW_SECONDS`); all images that arrive within that window are collected and processed together as one batch. Batches larger than `MAX_BATCH_SIZE` (default 50) are split into several requests.
+The images of each camera are stored in a sub-folder of the watch folder named after the camera (e.g. `watched-images/CAM01/`); deeper folders inside it are fine too. `watchdog` detects the new image, also when a whole folder of images is copied or moved in. The first new image opens a 1-minute window (configurable via `BATCH_WINDOW_SECONDS`); all images that arrive within that window are collected and processed together as one batch. Batches larger than `MAX_BATCH_SIZE` (default 50) are split into several requests.
 
 Images already in the watch folder at startup are processed as well (in batches of at most `MAX_BATCH_SIZE`); set `PROCESS_BACKLOG=false` to skip them. The watcher starts before the folder is listed, so images added meanwhile are not missed; images already stored in the database are skipped, and images still being copied are processed once the copy has finished. Each image is processed only once, even if it is seen by both the backlog and the watcher.
 
@@ -41,13 +41,13 @@ Images already in the watch folder at startup are processed as well (in batches 
 The pipeline calls `sentinel-rat-ml-pipeline` at `/api/v1/analyze` once per batch, with a list of image paths:
 
 ```json
-{"image_paths": ["CAM01_image_20260728T170840Z.jpg", "CAM01_image_20260728T170905Z.jpg"]}
+{"image_paths": ["CAM01/image_20260728T170840Z.jpg", "CAM01/image_20260728T170905Z.jpg"]}
 ```
 
 The service returns one result per image, each carrying its `image_path`:
 
 ```json
-{"results": [{"image_path": "CAM01_image_20260728T170840Z.jpg", "detections": [...]}, ...]}
+{"results": [{"image_path": "CAM01/image_20260728T170840Z.jpg", "detections": [...]}, ...]}
 ```
 
 Each result is then persisted on its own, so a failing image does not drop the rest of the batch.
@@ -57,7 +57,7 @@ Each image result is written in its own transaction into the tables of the [sent
 
 ```json
 {
-  "image_path": "CAM01_image_20260728T170840Z.jpg",
+  "image_path": "CAM01/image_20260728T170840Z.jpg",
   "detection_model": {"name": "megadetector", "version": "v5a"},
   "classification_model": {"name": "rodent-classifier", "version": "0.1"},
   "detections": [
@@ -76,11 +76,16 @@ Each image result is written in its own transaction into the tables of the [sent
 
 is stored as:
 
-`image_capture` — one row per image. The camera is looked up by the file name prefix (`CAM01`) and must already exist in the `camera` table; `captured_at` comes from the file name, else from EXIF, else the current time; `location` is the camera's current location.
+`image_capture` — one row per image; `image_path` is relative to the watch folder. The camera must already exist in the `camera` table (matched by name) and is resolved as follows:
+
+- image in a sub-folder: the camera named after the top-level sub-folder (`CAM01`), else the `device_id` in the image's EXIF `ImageDescription` (e.g. `{"device_id": "CAM01"}` or `device_id=CAM01`). If neither names a known camera, the image is skipped with an error.
+- image directly in the watch folder: the `device_id` in its EXIF `ImageDescription`, else the camera `DEFAULT_CAMERA_NAME` (default `hd-zoo-01`).
+
+`captured_at` comes from the file name, else from EXIF, else the current time; `location` is the camera's current location.
 
 | id | camera_id | image_path | captured_at | uploaded_at | location |
 |----|-----------|------------|-------------|-------------|----------|
-| 1 | 1 | CAM01_image_20260728T170840Z.jpg | 2026-07-28 17:08:40+00 | 2026-10-07 09:15:02+00 | POINT(80.6 7.3) |
+| 1 | 1 | CAM01/image_20260728T170840Z.jpg | 2026-07-28 17:08:40+00 | 2026-10-07 09:15:02+00 | POINT(80.6 7.3) |
 
 `object_detection` — one row per detected object.
 

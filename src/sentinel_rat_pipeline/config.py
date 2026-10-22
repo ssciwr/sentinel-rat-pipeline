@@ -12,6 +12,8 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(populate_by_name=True)
 
     watch_folder: str = Field(default="/data/images", alias="WATCH_FOLDER_DOCKER")
+    # camera of images directly in the watch folder whose metadata has no device_id
+    default_camera_name: str = Field(default="hd-zoo-01", alias="DEFAULT_CAMERA_NAME")
     database_url: str = Field(default="", alias="DATABASE_URL")
     ml_pipeline_url: str = Field(
         default="http://sentinel-rat-ml-pipeline:8000", alias="ML_PIPELINE_URL"
