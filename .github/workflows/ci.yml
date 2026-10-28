@@ -3,11 +3,15 @@ name: CI
 on:
   pull_request:
     branches: [main]
+  # after a PR is merged, so the coverage report of main stays up to date
+  push:
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # keep runs on main, so every merged commit gets its coverage report
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
