@@ -19,17 +19,42 @@ from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.orm import Session
 
 from sentinel_rat_pipeline.config import Settings
+from sentinel_rat_pipeline.scripts import persist_results as persist_module
 from sentinel_rat_pipeline.scripts.persist_results import (
     DEFAULT_MODEL_DESCRIPTION,
+    _engine,
     _get_captured_time,
-    camera_name_from_path,
+    _resolve_camera,
+    camera_folder,
     delete_result,
+    device_id_from_metadata,
     existing_image_paths,
     persist_results,
+    restore_missing_images,
 )
 
+
+@pytest.fixture(autouse=True)
+def fresh_engine_cache():
+    """Don't share cached (possibly mocked) engines between tests."""
+    _engine.cache_clear()
+    yield
+    _engine.cache_clear()
+
+
+def test_engine_is_reused_per_database_url() -> None:
+    with patch(
+        "sentinel_rat_pipeline.scripts.persist_results.create_engine",
+        side_effect=lambda *args, **kwargs: MagicMock(),
+    ) as create_engine_mock:
+        assert _engine("postgresql://a/db") is _engine("postgresql://a/db")
+        assert _engine("postgresql://b/db") is not _engine("postgresql://a/db")
+
+    assert create_engine_mock.call_count == 2
+
+
 RESULT = {
-    "image_path": "CAM01_20260730_115638.jpg",
+    "image_path": "cam01/20260730_115638.jpg",
     "detection_model": {"name": "megadetector", "version": "v5a"},
     "classification_model": {"name": "rodent-classifier", "version": "0.1"},
     "detections": [
@@ -57,18 +82,19 @@ RESULT = {
 @pytest.mark.parametrize(
     ("image_path", "expected"),
     [
-        ("CAM01_20260730_115638.jpg", "CAM01"),
-        ("sub/dir/cam-2_x.png", "cam-2"),
-        ("CAM03.jpg", "CAM03"),
+        ("cam01/20260730_115638.jpg", "cam01"),
+        ("cam-2/2026-10/x.png", "cam-2"),
+        ("x.jpg", None),
     ],
+    ids=["sub-folder", "nested", "top-level"],
 )
-def test_camera_name_from_path(image_path: str, expected: str) -> None:
-    assert camera_name_from_path(image_path) == expected
+def test_camera_folder(image_path: str, expected: str | None) -> None:
+    assert camera_folder(image_path) == expected
 
 
-def test_camera_name_from_path_empty() -> None:
-    with pytest.raises(ValueError):
-        camera_name_from_path("_20260730.jpg")
+def test_camera_folder_outside_watch_folder() -> None:
+    with pytest.raises(ValueError, match="outside the watch folder"):
+        camera_folder("/elsewhere/x.jpg")
 
 
 def _pack_ifd(entries: list[tuple[int, int, int, bytes]], offset: int) -> bytes:
@@ -96,6 +122,7 @@ def _write_exif_jpeg(
     datetime_original: str | None = None,
     offset_time_original: str | None = None,
     image_datetime: str | None = None,
+    image_description: str | None = None,
 ) -> Path:
     """Write a minimal JPEG whose only content is an EXIF APP1 segment."""
 
@@ -110,6 +137,8 @@ def _write_exif_jpeg(
         exif_entries.append(ascii_entry(0x9011, offset_time_original))
 
     ifd0_entries = []
+    if image_description:
+        ifd0_entries.append(ascii_entry(0x010E, image_description))
     if image_datetime:
         ifd0_entries.append(ascii_entry(0x0132, image_datetime))
     if exif_entries:
@@ -206,6 +235,100 @@ def test_get_captured_time_missing_file() -> None:
     assert _get_captured_time("does/not/exist.jpg") is None
 
 
+@pytest.mark.parametrize(
+    ("description", "expected"),
+    [
+        ('{"device_id": "hd-zoo-02", "battery": 80}', "hd-zoo-02"),
+        ("device_id=hd-zoo-02;battery=80", "hd-zoo-02"),
+        ("device_id: hd-zoo-02", "hd-zoo-02"),
+        ("trail camera", None),
+        (None, None),
+    ],
+    ids=["json", "key-equals", "key-colon", "no-device-id", "no-description"],
+)
+def test_device_id_from_metadata(
+    tmp_path: Path, description: str | None, expected: str | None
+) -> None:
+    image = _write_exif_jpeg(tmp_path / "x.jpg", image_description=description)
+    assert device_id_from_metadata(str(image)) == expected
+
+
+def test_device_id_from_metadata_missing_file() -> None:
+    assert device_id_from_metadata("does/not/exist.jpg") is None
+
+
+@pytest.mark.parametrize(
+    ("image_path", "device_id", "cameras", "expected"),
+    [
+        ("cam01/x.jpg", "cam02", {"cam01", "cam02"}, "cam01"),
+        ("unknown/x.jpg", "cam02", {"cam01", "cam02"}, "cam02"),
+        ("x.jpg", "cam02", {"cam02", "hd-zoo-01"}, "cam02"),
+        ("x.jpg", None, {"cam02", "hd-zoo-01"}, "hd-zoo-01"),
+        ("x.jpg", "unknown", {"cam02", "hd-zoo-01"}, "hd-zoo-01"),
+    ],
+    ids=[
+        "folder",
+        "unknown-folder-metadata",
+        "top-level-metadata",
+        "top-level-default",
+        "top-level-unknown-metadata-default",
+    ],
+)
+def test_resolve_camera(
+    monkeypatch: pytest.MonkeyPatch,
+    image_path: str,
+    device_id: str | None,
+    cameras: set[str],
+    expected: str,
+) -> None:
+    monkeypatch.setattr(persist_module, "settings", Settings())
+    monkeypatch.setattr(persist_module, "device_id_from_metadata", lambda _: device_id)
+    monkeypatch.setattr(
+        persist_module,
+        "_find_camera",
+        lambda _, name: name if name in cameras else None,
+    )
+
+    assert _resolve_camera(MagicMock(), image_path, image_path) == expected
+
+
+def test_resolve_camera_reads_metadata_only_if_folder_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_metadata = MagicMock(return_value="cam02")
+    monkeypatch.setattr(persist_module, "device_id_from_metadata", read_metadata)
+    monkeypatch.setattr(
+        persist_module,
+        "_find_camera",
+        lambda _, name: name if name in {"cam01", "cam02"} else None,
+    )
+
+    assert _resolve_camera(MagicMock(), "cam01/x.jpg", "/data/cam01/x.jpg") == "cam01"
+    read_metadata.assert_not_called()
+
+    assert _resolve_camera(MagicMock(), "unknown/x.jpg", "/data/unknown/x.jpg") == (
+        "cam02"
+    )
+    read_metadata.assert_called_once_with("/data/unknown/x.jpg")
+
+
+@pytest.mark.parametrize(
+    ("image_path", "device_id"),
+    [("unknown/x.jpg", None), ("unknown/x.jpg", "cam99"), ("x.jpg", None)],
+    ids=["sub-folder-no-metadata", "sub-folder-unknown-metadata", "no-default"],
+)
+def test_resolve_camera_unresolved(
+    monkeypatch: pytest.MonkeyPatch, image_path: str, device_id: str | None
+) -> None:
+    # a sub-folder image never falls back on the default camera
+    monkeypatch.setattr(persist_module, "settings", Settings())
+    monkeypatch.setattr(persist_module, "device_id_from_metadata", lambda _: device_id)
+    monkeypatch.setattr(persist_module, "_find_camera", lambda _, name: None)
+
+    with pytest.raises(LookupError, match=image_path):
+        _resolve_camera(MagicMock(), image_path, image_path)
+
+
 def test_persist_results_unknown_camera(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "sentinel_rat_pipeline.scripts.persist_results.settings",
@@ -214,7 +337,7 @@ def test_persist_results_unknown_camera(monkeypatch: pytest.MonkeyPatch) -> None
     mock_session = MagicMock()
     mock_session.__enter__.return_value = mock_session
     mock_session.scalars.return_value.all.return_value = []
-    mock_session.scalar.return_value = None  # image not stored yet
+    mock_session.scalars.return_value.first.return_value = None  # not stored yet
 
     with (
         patch("sentinel_rat_pipeline.scripts.persist_results.create_engine"),
@@ -222,9 +345,13 @@ def test_persist_results_unknown_camera(monkeypatch: pytest.MonkeyPatch) -> None
             "sentinel_rat_pipeline.scripts.persist_results.Session",
             return_value=mock_session,
         ),
-        pytest.raises(LookupError, match="CAM01"),
+        pytest.raises(LookupError, match="cam01"),
     ):
-        persist_results("CAM01_20260730_115638.jpg", RESULT)
+        persist_results(
+            "cam01/20260730_115638.jpg",
+            RESULT,
+            "/data/images/cam01/20260730_115638.jpg",
+        )
 
     mock_session.add.assert_not_called()
 
@@ -249,7 +376,8 @@ def db_url():
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
     Base.metadata.create_all(engine)
     with Session(engine) as session, session.begin():
-        session.add(Camera(name="CAM01", location="SRID=4326;POINT(80.6 7.3)"))
+        session.add(Camera(name="cam01", location="SRID=4326;POINT(80.6 7.3)"))
+        session.add(Camera(name="hd-zoo-01", location="SRID=4326;POINT(8.66 49.42)"))
     engine.dispose()
 
     yield url
@@ -272,14 +400,20 @@ def db_settings(db_url, monkeypatch: pytest.MonkeyPatch):
 
 
 def test_persist_results_writes_all_tables(db_settings) -> None:
-    image_id = persist_results("CAM01_20260730_115638.jpg", RESULT)
+    image_id = persist_results(
+        "cam01/20260730_115638.jpg", RESULT, "/data/images/cam01/20260730_115638.jpg"
+    )
 
     with Session(db_settings) as session:
         image = session.get(ImageCapture, image_id)
-        assert image.image_path == "CAM01_20260730_115638.jpg"
-        assert image.camera.name == "CAM01"
+        assert image.image_path == "cam01/20260730_115638.jpg"
+        assert image.camera.name == "cam01"
         assert (
-            session.scalar(select(func.ST_AsText(ImageCapture.location)))
+            session.scalar(
+                select(func.ST_AsText(ImageCapture.location)).where(
+                    ImageCapture.id == image_id
+                )
+            )
             == "POINT(80.6 7.3)"
         )
 
@@ -297,60 +431,225 @@ def test_persist_results_writes_all_tables(db_settings) -> None:
         assert session.scalar(select(func.count()).select_from(Taxonomy)) == 2
         assert session.scalar(select(func.count()).select_from(MLModel)) == 2
 
-    persist_results("CAM01_20260730_120000.jpg", RESULT)
+    persist_results(
+        "cam01/20260730_120000.jpg", RESULT, "/data/images/cam01/20260730_120000.jpg"
+    )
     with Session(db_settings) as session:
         assert session.scalar(select(func.count()).select_from(Taxonomy)) == 2
         assert session.scalar(select(func.count()).select_from(MLModel)) == 2
 
 
 def test_persist_results_no_detections(db_settings) -> None:
-    image_id = persist_results("CAM01_empty.jpg", {"detections": []})
+    image_id = persist_results(
+        "cam01/empty.jpg", {"detections": []}, "/data/images/cam01/empty.jpg"
+    )
 
     with Session(db_settings) as session:
         assert session.get(ImageCapture, image_id).object_detections == []
 
 
+def test_persist_results_stores_captured_time_from_filename(db_settings) -> None:
+    image_id = persist_results(
+        "cam01/image_20260730T115638Z.jpg",
+        {"detections": []},
+        "/data/images/cam01/image_20260730T115638Z.jpg",
+    )
+
+    with Session(db_settings) as session:
+        image = session.get(ImageCapture, image_id)
+        assert image.captured_at == datetime(
+            2026, 7, 30, 11, 56, 38, tzinfo=timezone.utc
+        )
+        # uploaded_at is the time of persisting, not the capture time
+        assert image.uploaded_at > image.captured_at
+
+
+def test_persist_results_top_level_image_uses_default_camera(db_settings) -> None:
+    image_id = persist_results(
+        "20260730_115638.jpg", {"detections": []}, "/data/images/20260730_115638.jpg"
+    )
+
+    with Session(db_settings) as session:
+        assert session.get(ImageCapture, image_id).camera.name == "hd-zoo-01"
+
+
+def test_persist_results_camera_from_metadata(db_settings, tmp_path: Path) -> None:
+    # the folder names no known camera, the metadata does
+    image = _write_exif_jpeg(
+        tmp_path / "x.jpg", image_description='{"device_id": "cam01"}'
+    )
+    image_id = persist_results(
+        "unknown/x.jpg", {"detections": []}, file_path=str(image)
+    )
+
+    with Session(db_settings) as session:
+        assert session.get(ImageCapture, image_id).camera.name == "cam01"
+
+
 def test_persist_results_unknown_camera_rolls_back(db_settings) -> None:
     with pytest.raises(LookupError):
-        persist_results("CAM99_20260730_115638.jpg", RESULT)
+        persist_results(
+            "cam99/20260730_115638.jpg",
+            RESULT,
+            "/data/images/cam99/20260730_115638.jpg",
+        )
 
     with Session(db_settings) as session:
         assert session.scalar(select(func.count()).select_from(ImageCapture)) == 0
 
 
-def _mark_tobe_deleted(engine, image_id: int) -> None:
+def test_persist_results_duplicate_camera_name_rolls_back(db_settings) -> None:
+    # camera.name is not unique in the data model, so the ambiguity is
+    # only detected when resolving the camera
+    with Session(db_settings) as session, session.begin():
+        for location in ("SRID=4326;POINT(1 1)", "SRID=4326;POINT(2 2)"):
+            session.add(Camera(name="cam02", location=location))
+
+    try:
+        with pytest.raises(ValueError, match="Multiple cameras named 'cam02'"):
+            persist_results(
+                "cam02/20260730_115638.jpg",
+                RESULT,
+                "/data/images/cam02/20260730_115638.jpg",
+            )
+
+        with Session(db_settings) as session:
+            assert (
+                session.scalar(select(func.count()).select_from(ImageCapture)) == 0
+            )
+    finally:
+        # cameras are shared by all tests of this module
+        with Session(db_settings) as session, session.begin():
+            for camera in session.scalars(
+                select(Camera).where(Camera.name == "cam02")
+            ).all():
+                session.delete(camera)
+
+
+def _mark_analyzed(engine, image_id: int) -> None:
     with Session(engine) as session, session.begin():
-        session.get(ImageCapture, image_id).tobe_deleted = True
+        session.get(ImageCapture, image_id).analyzed_at = datetime.now(timezone.utc)
 
 
-def test_delete_result_marks_tobe_deleted_image_as_moved(db_settings) -> None:
-    image_id = persist_results("CAM01_20260730_115638.jpg", RESULT)
-    _mark_tobe_deleted(db_settings, image_id)
-    delete_result("CAM01_20260730_115638.jpg")
+def test_delete_result_marks_analyzed_image_as_moved(db_settings) -> None:
+    image_id = persist_results(
+        "cam01/20260730_115638.jpg", RESULT, "/data/images/cam01/20260730_115638.jpg"
+    )
+    _mark_analyzed(db_settings, image_id)
+    delete_result("cam01/20260730_115638.jpg")
 
     with Session(db_settings) as session:
-        assert session.get(ImageCapture, image_id).is_moved is True
+        image = session.get(ImageCapture, image_id)
+        assert image.file_status == "moved"
+        assert image.stored_path is None
         assert session.scalar(select(func.count()).select_from(ObjectDetection)) == 2
 
 
-def test_delete_result_ignores_image_not_tobe_deleted(db_settings) -> None:
-    image_id = persist_results("CAM01_20260730_115638.jpg", RESULT)
-    delete_result("CAM01_20260730_115638.jpg")
+def test_delete_result_marks_image_not_analyzed_as_missing(db_settings) -> None:
+    image_id = persist_results(
+        "cam01/20260730_115638.jpg", RESULT, "/data/images/cam01/20260730_115638.jpg"
+    )
+    delete_result("cam01/20260730_115638.jpg")
 
     with Session(db_settings) as session:
-        assert session.get(ImageCapture, image_id).is_moved is not True
+        image = session.get(ImageCapture, image_id)
+        assert image.file_status == "missing"
+        assert image.analyzed_at is None
         assert session.scalar(select(func.count()).select_from(ObjectDetection)) == 2
 
 
-def test_delete_result_force_deletes_image_not_tobe_deleted(
+def test_delete_result_keeps_moved_image_and_stored_path(db_settings) -> None:
+    image_id = persist_results(
+        "cam01/a.jpg", {"detections": []}, "/data/images/cam01/a.jpg"
+    )
+    # e.g. the service that moved the image already recorded where it went
+    with Session(db_settings) as session, session.begin():
+        image = session.get(ImageCapture, image_id)
+        image.analyzed_at = datetime.now(timezone.utc)
+        image.file_status = "moved"
+        image.stored_path = "/archive/cam01/a.jpg"
+
+    delete_result("cam01/a.jpg")
+
+    with Session(db_settings) as session:
+        image = session.get(ImageCapture, image_id)
+        assert image.file_status == "moved"
+        assert image.stored_path == "/archive/cam01/a.jpg"
+
+
+def test_delete_result_keeps_missing_image_missing(db_settings) -> None:
+    image_id = persist_results(
+        "cam01/a.jpg", {"detections": []}, "/data/images/cam01/a.jpg"
+    )
+    delete_result("cam01/a.jpg")
+    # analyzed while missing: removing it again doesn't turn it into moved
+    _mark_analyzed(db_settings, image_id)
+
+    delete_result("cam01/a.jpg")
+
+    with Session(db_settings) as session:
+        assert session.get(ImageCapture, image_id).file_status == "missing"
+
+
+def test_persist_results_restores_missing_image_when_it_is_back(db_settings) -> None:
+    image_id = persist_results(
+        "cam01/a.jpg", {"detections": []}, "/data/images/cam01/a.jpg"
+    )
+    delete_result("cam01/a.jpg")
+
+    assert (
+        persist_results("cam01/a.jpg", {"detections": []}, "/data/images/cam01/a.jpg")
+        == image_id
+    )
+    with Session(db_settings) as session:
+        assert session.get(ImageCapture, image_id).file_status == "in_watch_folder"
+
+
+def test_restore_missing_images(db_settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    # force several update queries
+    monkeypatch.setattr(
+        "sentinel_rat_pipeline.scripts.persist_results.LOOKUP_CHUNK_SIZE", 1
+    )
+    for name in "abc":
+        persist_results(
+            f"cam01/{name}.jpg", {"detections": []}, f"/data/images/cam01/{name}.jpg"
+        )
+    delete_result("cam01/a.jpg")
+    delete_result("cam01/b.jpg")
+
+    # b stays missing; c was never missing
+    assert restore_missing_images(["cam01/a.jpg", "cam01/c.jpg"]) == 1
+    with Session(db_settings) as session:
+        missing = session.scalars(
+            select(ImageCapture.image_path).where(
+                ImageCapture.file_status == "missing"
+            )
+        ).all()
+    assert missing == ["cam01/b.jpg"]
+
+
+def test_restore_missing_images_without_missing_images(db_settings) -> None:
+    persist_results("cam01/a.jpg", {"detections": []}, "/data/images/cam01/a.jpg")
+
+    # a stored image that is not missing, and one that is not stored at all
+    assert restore_missing_images(["cam01/a.jpg", "cam01/unknown.jpg"]) == 0
+    with Session(db_settings) as session:
+        assert session.scalars(select(ImageCapture.file_status)).all() == [
+            "in_watch_folder"
+        ]
+
+
+def test_delete_result_force_deletes_image_not_analyzed(
     db_settings, db_url, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
         "sentinel_rat_pipeline.scripts.persist_results.settings",
         Settings(database_url=db_url, force_delete_image_in_db=True),
     )
-    persist_results("CAM01_20260730_115638.jpg", RESULT)
-    delete_result("CAM01_20260730_115638.jpg")
+    persist_results(
+        "cam01/20260730_115638.jpg", RESULT, "/data/images/cam01/20260730_115638.jpg"
+    )
+    delete_result("cam01/20260730_115638.jpg")
 
     with Session(db_settings) as session:
         for table in (ImageCapture, ObjectDetection, SpeciesClassification):
@@ -358,9 +657,18 @@ def test_delete_result_force_deletes_image_not_tobe_deleted(
 
 
 def test_persist_results_skips_already_stored_image(db_settings) -> None:
-    image_id = persist_results("CAM01_20260730_115638.jpg", RESULT)
+    image_id = persist_results(
+        "cam01/20260730_115638.jpg", RESULT, "/data/images/cam01/20260730_115638.jpg"
+    )
 
-    assert persist_results("CAM01_20260730_115638.jpg", RESULT) == image_id
+    assert (
+        persist_results(
+            "cam01/20260730_115638.jpg",
+            RESULT,
+            "/data/images/cam01/20260730_115638.jpg",
+        )
+        == image_id
+    )
     with Session(db_settings) as session:
         assert session.scalar(select(func.count()).select_from(ImageCapture)) == 1
         assert session.scalar(select(func.count()).select_from(ObjectDetection)) == 2
@@ -371,12 +679,12 @@ def test_existing_image_paths(db_settings, monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(
         "sentinel_rat_pipeline.scripts.persist_results.LOOKUP_CHUNK_SIZE", 1
     )
-    persist_results("CAM01_a.jpg", {"detections": []})
-    persist_results("CAM01_b.jpg", {"detections": []})
+    persist_results("cam01/a.jpg", {"detections": []}, "/data/images/cam01/a.jpg")
+    persist_results("cam01/b.jpg", {"detections": []}, "/data/images/cam01/b.jpg")
 
-    assert existing_image_paths(["CAM01_a.jpg", "CAM01_b.jpg", "CAM01_c.jpg"]) == {
-        "CAM01_a.jpg",
-        "CAM01_b.jpg",
+    assert existing_image_paths(["cam01/a.jpg", "cam01/b.jpg", "cam01/c.jpg"]) == {
+        "cam01/a.jpg",
+        "cam01/b.jpg",
     }
     assert existing_image_paths([]) == set()
 
@@ -397,7 +705,9 @@ def test_persist_results_ml_model_description(
         "detection_model": model_info,
         "detections": [{**RESULT["detections"][0], "classifications": []}],
     }
-    persist_results("CAM01_20260730_115638.jpg", result)
+    persist_results(
+        "cam01/20260730_115638.jpg", result, "/data/images/cam01/20260730_115638.jpg"
+    )
 
     with Session(db_settings) as session:
         assert session.scalars(select(MLModel.description)).one() == expected

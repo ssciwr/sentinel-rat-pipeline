@@ -1,5 +1,5 @@
-"""Resolve new images in the watch folder using watchdog and group them into
-time-windowed batches."""
+"""Resolve new images in the watch folder and its sub-folders (one per camera)
+using watchdog and group them into time-windowed batches."""
 
 from __future__ import annotations
 
@@ -193,8 +193,13 @@ class ImageDeletedHandler(FileSystemEventHandler):
 
 
 def list_images(watch_folder: str | None = None) -> list[str]:
+    """Images in the watch folder and all of its sub-folders."""
     folder = Path(watch_folder or settings.watch_folder)
-    return [str(p) for p in folder.glob("*") if p.suffix.lower() in IMAGE_SUFFIXES]
+    return [
+        str(p)
+        for p in folder.rglob("*")
+        if p.suffix.lower() in IMAGE_SUFFIXES and p.is_file()
+    ]
 
 
 def _split_stable(image_paths: list[str]) -> tuple[list[str], list[str]]:
@@ -299,10 +304,11 @@ def start_watch(
             on_deleted(src_path)
 
         deleted_handler = ImageDeletedHandler(handle_deleted)
-        observer.schedule(deleted_handler, str(folder), recursive=False)
+        observer.schedule(deleted_handler, str(folder), recursive=True)
 
     try:
-        observer.schedule(created_handler, str(folder), recursive=False)
+        # recursive: also reports images inside folders created or moved in
+        observer.schedule(created_handler, str(folder), recursive=True)
         observer.start()
     except Exception as exc:
         logger.error("Failed to start watchdog observer: %s", exc)

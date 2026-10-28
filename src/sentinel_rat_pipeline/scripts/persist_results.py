@@ -6,7 +6,7 @@ per-image result (one entry in ``detections`` per detected object, each with
 zero or more species classifications)::
 
     {
-        "image_path": "CAM01_20260730_115638.jpg",
+        "image_path": "hd-zoo-01/image_20260730T115638Z.jpg",
         "detection_model": {"name": "megadetector", "version": "v5a"},
         "classification_model": {"name": "rodent-classifier", "version": "0.1"},
         "detections": [
@@ -31,7 +31,9 @@ from __future__ import annotations
 
 import logging
 import re
-from pathlib import Path
+from collections.abc import Iterator
+from functools import lru_cache
+from pathlib import Path, PurePosixPath
 
 from dashboard.db.data_model import (
     Camera,
@@ -41,7 +43,7 @@ from dashboard.db.data_model import (
     SpeciesClassification,
     Taxonomy,
 )
-from sqlalchemy import create_engine, select
+from sqlalchemy import Engine, create_engine, select, update
 from sqlalchemy.orm import Session
 
 from datetime import datetime, timezone
@@ -58,8 +60,9 @@ DEFAULT_MODEL_DESCRIPTION = "Added by sentinel-rat-pipeline"
 # max number of paths per "IN (...)" query when looking up stored images
 LOOKUP_CHUNK_SIZE = 1000
 
-# image files are named "<camera_name>_<anything>.<ext>", e.g. "CAM01_20260730_115638.jpg"
-CAMERA_NAME_SEPARATOR = "_"
+# EXIF ImageDescription carries the camera name as "device_id", e.g.
+# '{"device_id": "hd-zoo-02", ...}', "device_id=hd-zoo-02" or "device_id: hd-zoo-02"
+DEVICE_ID_PATTERN = re.compile(r"device_id[\"']?\s*[:=]\s*[\"']?([^\s\"',;}]+)")
 
 TAXONOMY_FIELDS = (
     "kingdom",
@@ -73,22 +76,88 @@ TAXONOMY_FIELDS = (
 )
 
 
-def camera_name_from_path(image_path: str) -> str:
-    """Extract the camera name from the image file name."""
-
-    camera_name = Path(image_path).stem.split(CAMERA_NAME_SEPARATOR, 1)[0]
-    if not camera_name:
-        raise ValueError(f"Cannot extract camera name from {image_path}")
-    return camera_name
+@lru_cache
+def _engine(database_url: str) -> Engine:
+    """One engine (and connection pool) per database, shared by all calls."""
+    # pre-ping replaces pooled connections that died, e.g. after a DB restart
+    return create_engine(database_url, pool_pre_ping=True)
 
 
-def _get_camera(session: Session, camera_name: str) -> Camera:
+def camera_folder(image_path: str) -> str | None:
+    """Name of the sub-folder of the watch folder that holds the image, or None
+    if the image lies directly in the watch folder.
+
+    ``image_path`` is relative to the watch folder; for nested folders the
+    top-level one names the camera, e.g. "hd-zoo-02/2026-10/x.jpg" -> "hd-zoo-02".
+    An absolute path lies outside the watch folder and raises ValueError.
+    """
+
+    path = PurePosixPath(image_path)
+    if path.is_absolute():
+        raise ValueError(f"{image_path} is outside the watch folder")
+    if len(path.parts) < 2:
+        return None
+    return path.parts[0]
+
+
+def _read_exif(file_path: str) -> dict | None:
+    try:
+        with open(file_path, "rb") as f:
+            return exifread.process_file(f, details=False)
+    except Exception as e:
+        logger.warning("Failed to read EXIF data from %s: %s", file_path, e)
+        return None
+
+
+def device_id_from_metadata(file_path: str) -> str | None:
+    """Extract the device_id from the EXIF ImageDescription of the image."""
+
+    tags = _read_exif(file_path)
+    description = tags.get("Image ImageDescription") if tags else None
+    if description is None:
+        return None
+    match = DEVICE_ID_PATTERN.search(str(description))
+    return match.group(1) if match else None
+
+
+def _find_camera(session: Session, camera_name: str) -> Camera | None:
     cameras = session.scalars(select(Camera).where(Camera.name == camera_name)).all()
-    if not cameras:
-        raise LookupError(f"No camera named {camera_name!r} in camera table")
     if len(cameras) > 1:
         raise ValueError(f"Multiple cameras named {camera_name!r} in camera table")
-    return cameras[0]
+    return cameras[0] if cameras else None
+
+
+def _camera_candidates(folder: str | None, file_path: str) -> Iterator[str]:
+    """Camera names to try, in order of priority. Lazy, so the metadata is
+    only read if the folder names no known camera."""
+
+    if folder is not None:
+        yield folder
+    device_id = device_id_from_metadata(file_path)
+    if device_id:
+        yield device_id
+    if folder is None:
+        yield settings.default_camera_name
+
+
+def _resolve_camera(session: Session, image_path: str, file_path: str) -> Camera:
+    """Find the camera of an image.
+
+    An image in a sub-folder belongs to the camera named after the folder,
+    else to the camera of the device_id in its metadata. An image directly in
+    the watch folder belongs to the camera of the device_id in its metadata,
+    else to ``settings.default_camera_name``.
+    """
+
+    tried = []
+    for name in _camera_candidates(camera_folder(image_path), file_path):
+        tried.append(name)
+        camera = _find_camera(session, name)
+        if camera is not None:
+            return camera
+    raise LookupError(
+        f"No camera for {image_path} in camera table (tried {tried or 'nothing'})"
+    )
 
 
 def _get_or_create_ml_model(session: Session, model_info: dict, task: str) -> MLModel:
@@ -155,11 +224,8 @@ def _get_captured_time(image_path: str) -> datetime | None:
         except ValueError:
             pass  # invalid date values, fall back to EXIF
 
-    try:
-        with open(image_path, "rb") as f:
-            tags = exifread.process_file(f, details=False)
-    except Exception as e:
-        logger.warning("Failed to read EXIF data from %s: %s", image_path, e)
+    tags = _read_exif(image_path)
+    if tags is None:
         return None
 
     raw = tags.get("EXIF DateTimeOriginal") or tags.get("Image DateTime")
@@ -195,9 +261,8 @@ def _get_captured_time(image_path: str) -> datetime | None:
 def existing_image_paths(image_paths: list[str]) -> set[str]:
     """Return the subset of ``image_paths`` already stored in image_capture."""
 
-    engine = create_engine(settings.database_url)
     found: set[str] = set()
-    with Session(engine) as session:
+    with Session(_engine(settings.database_url)) as session:
         for start in range(0, len(image_paths), LOOKUP_CHUNK_SIZE):
             chunk = image_paths[start : start + LOOKUP_CHUNK_SIZE]
             found.update(
@@ -210,25 +275,55 @@ def existing_image_paths(image_paths: list[str]) -> set[str]:
     return found
 
 
-def persist_results(image_path: str, result: dict) -> int:
+def restore_missing_images(image_paths: list[str]) -> int:
+    """Set ``file_status`` of stored images marked missing whose file is back
+    in the watch folder to ``in_watch_folder``. Returns the number of rows
+    updated."""
+
+    updated = 0
+    with Session(_engine(settings.database_url)) as session, session.begin():
+        for start in range(0, len(image_paths), LOOKUP_CHUNK_SIZE):
+            chunk = image_paths[start : start + LOOKUP_CHUNK_SIZE]
+            updated += session.execute(
+                update(ImageCapture)
+                .where(
+                    ImageCapture.image_path.in_(chunk),
+                    ImageCapture.file_status == "missing",
+                )
+                .values(file_status="in_watch_folder")
+            ).rowcount
+    if updated:
+        logger.info("Restored %s missing image(s) back in the folder", updated)
+    return updated
+
+
+def persist_results(image_path: str, result: dict, file_path: str) -> int:
     """Store an image and its detections/classifications in one transaction.
 
+    ``image_path`` is the path stored in the database, relative to the watch
+    folder; ``file_path`` is where the file can be read (e.g. its path in the
+    container), for its camera and capture time metadata.
+
     Returns the id of the new image_capture row. If the image is already
-    stored, nothing is written and the id of the existing row is returned.
+    stored, nothing is written and the id of the existing row is returned;
+    if that row was marked missing, the file is back and it is restored.
     """
 
-    engine = create_engine(settings.database_url)
-    with Session(engine) as session, session.begin():
-        existing_id = session.scalar(
-            select(ImageCapture.id).where(ImageCapture.image_path == image_path)
-        )
-        if existing_id is not None:
-            logger.warning("Image %s is already stored, skipping", image_path)
-            return existing_id
+    with Session(_engine(settings.database_url)) as session, session.begin():
+        existing = session.scalars(
+            select(ImageCapture).where(ImageCapture.image_path == image_path)
+        ).first()
+        if existing is not None:
+            if existing.file_status == "missing":
+                existing.file_status = "in_watch_folder"
+                logger.info("Image %s is back, restored it", image_path)
+            else:
+                logger.warning("Image %s is already stored, skipping", image_path)
+            return existing.id
 
-        camera = _get_camera(session, camera_name_from_path(image_path))
+        camera = _resolve_camera(session, image_path, file_path)
 
-        image_captured_at = _get_captured_time(image_path)
+        image_captured_at = _get_captured_time(file_path)
         if image_captured_at is None:
             # use the current time if we can't determine the capture time
             image_captured_at = datetime.now(timezone.utc)
@@ -286,15 +381,17 @@ def persist_results(image_path: str, result: dict) -> int:
 def delete_result(image_path: str) -> None:
     """Handle the removal of an image file from the watch folder.
 
-    By default, image_capture rows marked with ``tobe_deleted`` are flagged
-    as ``is_moved``; the rows themselves are kept. If
-    ``settings.force_delete_image_in_db`` is set, all rows for the image are
-    deleted regardless of ``tobe_deleted``, along with their detections,
-    classifications, and corrections (via ORM cascades).
+    By default, image_capture rows still in the watch folder are marked
+    ``moved`` if they are analyzed (``analyzed_at`` is set); rows not analyzed
+    yet were not meant to leave the watch folder, so they are marked
+    ``missing`` and an error is logged. Rows already marked ``moved`` (e.g.
+    with their ``stored_path``) or ``missing`` are left as is. The rows
+    themselves are kept. If ``settings.force_delete_image_in_db`` is set,
+    all rows for the image are deleted regardless of ``analyzed_at``,
+    along with their detections, classifications, and corrections (via ORM cascades).
     """
 
-    engine = create_engine(settings.database_url)
-    with Session(engine) as session, session.begin():
+    with Session(_engine(settings.database_url)) as session, session.begin():
         statement = select(ImageCapture).where(ImageCapture.image_path == image_path)
         if settings.force_delete_image_in_db:
             images = session.scalars(statement).all()
@@ -305,11 +402,21 @@ def delete_result(image_path: str) -> None:
             )
             return
 
-        images = session.scalars(
-            statement.where(ImageCapture.tobe_deleted.is_(True))
-        ).all()
-        for image in images:
-            image.is_moved = True
-        logger.info(
-            "Marked %s image_capture row(s) as moved for %s", len(images), image_path
-        )
+        moved = missing = 0
+        for image in session.scalars(statement).all():
+            if image.file_status != "in_watch_folder":
+                continue
+            if image.analyzed_at is not None:
+                image.file_status = "moved"
+                moved += 1
+            else:
+                image.file_status = "missing"
+                missing += 1
+        logger.info("Marked %s image_capture row(s) as moved for %s", moved, image_path)
+        if missing:
+            logger.error(
+                "Image %s was removed from the watch folder before being "
+                "analyzed; marked %s image_capture row(s) as missing",
+                image_path,
+                missing,
+            )
