@@ -114,7 +114,9 @@ is stored as:
 
 When an image is removed from the watch folder, its `image_capture` row is kept:
 
-- if the row is marked `tobe_deleted`, it is marked `is_moved`;
-- otherwise the image was not meant to leave the watch folder: `missing_since` is set to the time of removal and an error is logged. If the image is put back, `missing_since` is cleared again (when the watcher sees it, or at the next startup).
+- if the image is analyzed (`analyzed_at` is set), its `file_status` is set to `moved`;
+- otherwise the image was not meant to leave the watch folder: its `file_status` is set to `missing` and an error is logged. If the image is put back, its `file_status` is set to `in_watch_folder` again (when the watcher sees it, or at the next startup).
 
-With `FORCE_DELETE_IMAGE_IN_DB=true`, the row is deleted instead, together with its detections, classifications and corrections.
+Rows already marked `moved` (e.g. by the service that moved the image, together with its `stored_path`) can be deleted from the DB if needed.
+
+With `FORCE_DELETE_IMAGE_IN_DB=true`, the row is deleted instead, together with its detections, classifications and corrections. TODO: how about the analysis results extracted from the image? Should they be kept for later reference, or updated accordingly?

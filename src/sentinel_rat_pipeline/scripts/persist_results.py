@@ -275,9 +275,10 @@ def existing_image_paths(image_paths: list[str]) -> set[str]:
     return found
 
 
-def clear_missing_since(image_paths: list[str]) -> int:
-    """Clear ``missing_since`` of stored images whose file is back in the watch
-    folder. Returns the number of rows updated."""
+def restore_missing_images(image_paths: list[str]) -> int:
+    """Set ``file_status`` of stored images marked missing whose file is back
+    in the watch folder to ``in_watch_folder``. Returns the number of rows
+    updated."""
 
     updated = 0
     with Session(_engine(settings.database_url)) as session, session.begin():
@@ -287,12 +288,12 @@ def clear_missing_since(image_paths: list[str]) -> int:
                 update(ImageCapture)
                 .where(
                     ImageCapture.image_path.in_(chunk),
-                    ImageCapture.missing_since.is_not(None),
+                    ImageCapture.file_status == "missing",
                 )
-                .values(missing_since=None)
+                .values(file_status="in_watch_folder")
             ).rowcount
     if updated:
-        logger.info("Cleared missing_since of %s image(s) back in the folder", updated)
+        logger.info("Restored %s missing image(s) back in the folder", updated)
     return updated
 
 
@@ -305,7 +306,7 @@ def persist_results(image_path: str, result: dict, file_path: str) -> int:
 
     Returns the id of the new image_capture row. If the image is already
     stored, nothing is written and the id of the existing row is returned;
-    if that row was marked missing, the file is back and the mark is cleared.
+    if that row was marked missing, the file is back and it is restored.
     """
 
     with Session(_engine(settings.database_url)) as session, session.begin():
@@ -313,9 +314,9 @@ def persist_results(image_path: str, result: dict, file_path: str) -> int:
             select(ImageCapture).where(ImageCapture.image_path == image_path)
         ).first()
         if existing is not None:
-            if existing.missing_since is not None:
-                existing.missing_since = None
-                logger.info("Image %s is back, cleared missing_since", image_path)
+            if existing.file_status == "missing":
+                existing.file_status = "in_watch_folder"
+                logger.info("Image %s is back, restored it", image_path)
             else:
                 logger.warning("Image %s is already stored, skipping", image_path)
             return existing.id
@@ -380,11 +381,13 @@ def persist_results(image_path: str, result: dict, file_path: str) -> int:
 def delete_result(image_path: str) -> None:
     """Handle the removal of an image file from the watch folder.
 
-    By default, image_capture rows marked with ``tobe_deleted`` are flagged
-    as ``is_moved``; other rows were not meant to leave the watch folder, so
-    ``missing_since`` is set (if not set already) and an error is logged. The
-    rows themselves are kept. If ``settings.force_delete_image_in_db`` is set,
-    all rows for the image are deleted regardless of ``tobe_deleted``,
+    By default, image_capture rows still in the watch folder are marked
+    ``moved`` if they are analyzed (``analyzed_at`` is set); rows not analyzed
+    yet were not meant to leave the watch folder, so they are marked
+    ``missing`` and an error is logged. Rows already marked ``moved`` (e.g.
+    with their ``stored_path``) or ``missing`` are left as is. The rows
+    themselves are kept. If ``settings.force_delete_image_in_db`` is set,
+    all rows for the image are deleted regardless of ``analyzed_at``,
     along with their detections, classifications, and corrections (via ORM cascades).
     """
 
@@ -401,17 +404,19 @@ def delete_result(image_path: str) -> None:
 
         moved = missing = 0
         for image in session.scalars(statement).all():
-            if image.tobe_deleted:
-                image.is_moved = True
+            if image.file_status != "in_watch_folder":
+                continue
+            if image.analyzed_at is not None:
+                image.file_status = "moved"
                 moved += 1
-            elif image.missing_since is None:
-                image.missing_since = datetime.now(timezone.utc)
+            else:
+                image.file_status = "missing"
                 missing += 1
         logger.info("Marked %s image_capture row(s) as moved for %s", moved, image_path)
         if missing:
             logger.error(
-                "Image %s was removed from the watch folder without being marked "
-                "tobe_deleted; marked %s image_capture row(s) as missing",
+                "Image %s was removed from the watch folder before being "
+                "analyzed; marked %s image_capture row(s) as missing",
                 image_path,
                 missing,
             )
