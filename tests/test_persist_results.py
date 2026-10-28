@@ -448,6 +448,22 @@ def test_persist_results_no_detections(db_settings) -> None:
         assert session.get(ImageCapture, image_id).object_detections == []
 
 
+def test_persist_results_stores_captured_time_from_filename(db_settings) -> None:
+    image_id = persist_results(
+        "cam01/image_20260730T115638Z.jpg",
+        {"detections": []},
+        "/data/images/cam01/image_20260730T115638Z.jpg",
+    )
+
+    with Session(db_settings) as session:
+        image = session.get(ImageCapture, image_id)
+        assert image.captured_at == datetime(
+            2026, 7, 30, 11, 56, 38, tzinfo=timezone.utc
+        )
+        # uploaded_at is the time of persisting, not the capture time
+        assert image.uploaded_at > image.captured_at
+
+
 def test_persist_results_top_level_image_uses_default_camera(db_settings) -> None:
     image_id = persist_results(
         "20260730_115638.jpg", {"detections": []}, "/data/images/20260730_115638.jpg"
@@ -610,6 +626,17 @@ def test_restore_missing_images(db_settings, monkeypatch: pytest.MonkeyPatch) ->
             )
         ).all()
     assert missing == ["cam01/b.jpg"]
+
+
+def test_restore_missing_images_without_missing_images(db_settings) -> None:
+    persist_results("cam01/a.jpg", {"detections": []}, "/data/images/cam01/a.jpg")
+
+    # a stored image that is not missing, and one that is not stored at all
+    assert restore_missing_images(["cam01/a.jpg", "cam01/unknown.jpg"]) == 0
+    with Session(db_settings) as session:
+        assert session.scalars(select(ImageCapture.file_status)).all() == [
+            "in_watch_folder"
+        ]
 
 
 def test_delete_result_force_deletes_image_not_analyzed(
