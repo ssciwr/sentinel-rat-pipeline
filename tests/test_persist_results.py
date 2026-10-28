@@ -482,6 +482,34 @@ def test_persist_results_unknown_camera_rolls_back(db_settings) -> None:
         assert session.scalar(select(func.count()).select_from(ImageCapture)) == 0
 
 
+def test_persist_results_duplicate_camera_name_rolls_back(db_settings) -> None:
+    # camera.name is not unique in the data model, so the ambiguity is
+    # only detected when resolving the camera
+    with Session(db_settings) as session, session.begin():
+        for location in ("SRID=4326;POINT(1 1)", "SRID=4326;POINT(2 2)"):
+            session.add(Camera(name="cam02", location=location))
+
+    try:
+        with pytest.raises(ValueError, match="Multiple cameras named 'cam02'"):
+            persist_results(
+                "cam02/20260730_115638.jpg",
+                RESULT,
+                "/data/images/cam02/20260730_115638.jpg",
+            )
+
+        with Session(db_settings) as session:
+            assert (
+                session.scalar(select(func.count()).select_from(ImageCapture)) == 0
+            )
+    finally:
+        # cameras are shared by all tests of this module
+        with Session(db_settings) as session, session.begin():
+            for camera in session.scalars(
+                select(Camera).where(Camera.name == "cam02")
+            ).all():
+                session.delete(camera)
+
+
 def _mark_analyzed(engine, image_id: int) -> None:
     with Session(engine) as session, session.begin():
         session.get(ImageCapture, image_id).analyzed_at = datetime.now(timezone.utc)
