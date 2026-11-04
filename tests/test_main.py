@@ -21,26 +21,34 @@ def mocks(monkeypatch: pytest.MonkeyPatch) -> tuple[MagicMock, MagicMock]:
 def test_on_new_images_analyzes_batch_and_persists_each(mocks) -> None:
     run_analysis, persist = mocks
     run_analysis.return_value = [
-        {"image_path": "b.jpg", "detections": []},
+        {"image_path": "cam01/b.jpg", "detections": []},
         {"image_path": "a.jpg", "detections": []},
     ]
 
-    main.on_new_images(["/data/images/a.jpg", "/data/images/b.jpg"])
+    main.on_new_images(["/data/images/a.jpg", "/data/images/cam01/b.jpg"])
 
-    run_analysis.assert_called_once_with(["a.jpg", "b.jpg"])
-    assert [c.args for c in persist.call_args_list] == [
-        ("a.jpg", {"image_path": "a.jpg", "detections": []}),
-        ("b.jpg", {"image_path": "b.jpg", "detections": []}),
+    run_analysis.assert_called_once_with(["a.jpg", "cam01/b.jpg"])
+    # host-relative paths are stored, the files are read at their container path
+    assert [(c.args, c.kwargs) for c in persist.call_args_list] == [
+        (
+            ("a.jpg", {"image_path": "a.jpg", "detections": []}),
+            {"file_path": "/data/images/a.jpg"},
+        ),
+        (
+            ("cam01/b.jpg", {"image_path": "cam01/b.jpg", "detections": []}),
+            {"file_path": "/data/images/cam01/b.jpg"},
+        ),
     ]
 
 
-def test_on_new_images_keeps_paths_outside_watch_folder(mocks) -> None:
-    run_analysis, _ = mocks
-    run_analysis.return_value = []
+def test_on_new_images_skips_paths_outside_watch_folder(mocks) -> None:
+    run_analysis, persist = mocks
+    run_analysis.return_value = [{"image_path": "a.jpg", "detections": []}]
 
-    main.on_new_images(["/elsewhere/a.jpg"])
+    main.on_new_images(["/elsewhere/b.jpg", "/data/images/a.jpg"])
 
-    run_analysis.assert_called_once_with(["/elsewhere/a.jpg"])
+    run_analysis.assert_called_once_with(["a.jpg"])
+    assert [c.args[0] for c in persist.call_args_list] == ["a.jpg"]
 
 
 def test_on_new_images_analysis_failure_persists_nothing(mocks) -> None:
@@ -138,11 +146,31 @@ def test_unprocessed_images_drops_stored_images(
     monkeypatch.setattr(main, "settings", Settings(watch_folder="/data/images"))
     existing = MagicMock(return_value={"a.jpg"})
     monkeypatch.setattr(main, "existing_image_paths", existing)
+    restore_missing = MagicMock()
+    monkeypatch.setattr(main, "restore_missing_images", restore_missing)
 
     remaining = main._unprocessed_images(["/data/images/a.jpg", "/data/images/b.jpg"])
 
     existing.assert_called_once_with(["a.jpg", "b.jpg"])
     assert remaining == ["/data/images/b.jpg"]
+    # a stored image found at startup is in the folder, so it is not missing
+    restore_missing.assert_called_once_with(["a.jpg"])
+
+
+def test_unprocessed_images_drops_images_outside_watch_folder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(main, "settings", Settings(watch_folder="/data/images"))
+    existing = MagicMock(return_value=set())
+    monkeypatch.setattr(main, "existing_image_paths", existing)
+    restore_missing = MagicMock()
+    monkeypatch.setattr(main, "restore_missing_images", restore_missing)
+
+    remaining = main._unprocessed_images(["/elsewhere/a.jpg", "/data/images/b.jpg"])
+
+    existing.assert_called_once_with(["b.jpg"])
+    assert remaining == ["/data/images/b.jpg"]
+    restore_missing.assert_not_called()
 
 
 def test_to_host_relative_accepts_resolved_watch_folder(
