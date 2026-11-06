@@ -34,6 +34,14 @@ class Settings(BaseSettings):
     analysis_tz: str = Field(default="Asia/Colombo", alias="ANALYSIS_TZ")
     # local time (in ANALYSIS_TZ) at which the scheduler runs the daily analysis
     analysis_time: time = Field(default=time(0, 0), alias="ANALYSIS_TIME")
+    # the daily analysis leaves out results below these confidence thresholds,
+    # for all detection and classification models; 0 keeps all results
+    det_conf_threshold: float = Field(
+        default=0.0, ge=0, le=1, alias="DET_CONF_THRESHOLD"
+    )
+    clas_conf_threshold: float = Field(
+        default=0.0, ge=0, le=1, alias="CLAS_CONF_THRESHOLD"
+    )
 
     @field_validator("analysis_tz")
     @classmethod

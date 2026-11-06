@@ -67,6 +67,32 @@ def test_run_day_reports_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     assert daily_analysis.run_day(MagicMock(), date(2026, 10, 1), TZ) is False
 
 
+@pytest.mark.parametrize("recompute", [False, True])
+def test_run_day_passes_configured_thresholds(
+    monkeypatch: pytest.MonkeyPatch, recompute: bool
+) -> None:
+    crud = MagicMock()
+    crud.compute_daily_results.return_value = []
+    monkeypatch.setattr(daily_analysis, "daily_analysis_result_crud", crud)
+    monkeypatch.setattr(daily_analysis, "Session", MagicMock())
+    monkeypatch.setattr(
+        daily_analysis,
+        "settings",
+        Settings(det_conf_threshold=0.4, clas_conf_threshold=0.6),
+    )
+
+    assert daily_analysis.run_day(
+        MagicMock(), date(2026, 10, 1), TZ, recompute=recompute
+    )
+
+    kwargs = crud.compute_daily_results.call_args.kwargs
+    assert kwargs == {
+        "recompute": recompute,
+        "det_threshold": 0.4,
+        "clas_threshold": 0.6,
+    }
+
+
 @pytest.fixture
 def cli(monkeypatch: pytest.MonkeyPatch) -> tuple[MagicMock, MagicMock]:
     monkeypatch.setattr(

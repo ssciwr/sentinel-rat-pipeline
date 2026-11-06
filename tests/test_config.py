@@ -45,6 +45,30 @@ def test_analysis_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.analysis_time == time(0, 30)
 
 
+def test_thresholds_default_to_zero() -> None:
+    settings = Settings()
+    assert settings.det_conf_threshold == 0.0
+    assert settings.clas_conf_threshold == 0.0
+
+
+def test_thresholds_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DET_CONF_THRESHOLD", "0.4")
+    monkeypatch.setenv("CLAS_CONF_THRESHOLD", "1")
+    settings = Settings()
+    assert settings.det_conf_threshold == 0.4
+    assert settings.clas_conf_threshold == 1.0
+
+
+@pytest.mark.parametrize("name", ["DET_CONF_THRESHOLD", "CLAS_CONF_THRESHOLD"])
+@pytest.mark.parametrize("value", ["high", "1.5", "-0.1", "nan"])
+def test_threshold_must_be_between_zero_and_one(
+    monkeypatch: pytest.MonkeyPatch, name: str, value: str
+) -> None:
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValidationError):
+        Settings()
+
+
 def test_analysis_tz_must_be_known() -> None:
     with pytest.raises(ValidationError):
         Settings(analysis_tz="Mars/Olympus")

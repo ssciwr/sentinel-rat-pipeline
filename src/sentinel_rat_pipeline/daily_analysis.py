@@ -39,7 +39,12 @@ def run_day(engine: Engine, day: date, tz: str, recompute: bool = False) -> bool
     try:
         with Session(engine) as session:
             rows = daily_analysis_result_crud.compute_daily_results(
-                session, day, tz, recompute=recompute
+                session,
+                day,
+                tz,
+                recompute=recompute,
+                det_threshold=settings.det_conf_threshold,
+                clas_threshold=settings.clas_conf_threshold,
             )
             logger.info("Daily analysis of %s: %s result row(s)", day, len(rows))
     except Exception:
