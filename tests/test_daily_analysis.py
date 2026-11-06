@@ -271,12 +271,12 @@ def test_run_pending_aggregates_past_days_once(engine) -> None:
         assert [(row.start_time, row.taxonomy_count) for row in rows] == [
             (_local(yesterday, 0), 1)
         ]
-        tobe_deleted = dict(
+        analyzed = dict(
             session.execute(
-                select(ImageCapture.image_path, ImageCapture.tobe_deleted)
+                select(ImageCapture.image_path, ImageCapture.analyzed_at.is_not(None))
             ).all()
         )
-        assert tobe_deleted == {"CAM01_a.jpg": True, "CAM01_b.jpg": False}
+        assert analyzed == {"CAM01_a.jpg": True, "CAM01_b.jpg": False}
 
 
 def _seed(engine) -> None:

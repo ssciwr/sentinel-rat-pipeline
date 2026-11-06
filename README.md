@@ -119,7 +119,7 @@ When an image is removed from the watch folder, its `image_capture` row is kept:
 
 Rows already marked `moved` (e.g. by the service that moved the image, together with its `stored_path`) can be deleted from the DB if needed.
 
-With `FORCE_DELETE_IMAGE_IN_DB=true`, the row is deleted instead, together with its detections, classifications and corrections. TODO: how about the analysis results extracted from the image? Should they be kept for later reference, or updated accordingly?
+With `FORCE_DELETE_IMAGE_IN_DB=true`, the row is deleted instead, together with its detections, classifications and corrections. The daily analysis results of the image are kept for later reference, but its camera and day can't be rebuilt anymore (see the README of sentinel-rat-dashboard).
 
 ## Daily analysis
 
@@ -132,15 +132,20 @@ python -m sentinel_rat_pipeline.daily_analysis
 python -m sentinel_rat_pipeline.daily_analysis --once
 # aggregate one day, then exit; --recompute rebuilds it from all its images
 python -m sentinel_rat_pipeline.daily_analysis --date 2026-10-01 --recompute
+# rebuild all past days with the configured thresholds, then exit
+python -m sentinel_rat_pipeline.daily_analysis --recompute-all
 ```
 
-Each run aggregates every day before today that still has images not aggregated yet (`tobe_deleted` is `False`): yesterday, days missed while the scheduler was not running, and days with images that arrived late (they are merged into the existing results). Corrections of already aggregated images are applied by the dashboard as soon as they are saved, so the scheduler doesn't have to look for them.
+Each run aggregates every day before today that still has images not aggregated yet (`analyzed_at` is `NULL`): yesterday, days missed while the scheduler was not running, and days with images that arrived late (they are merged into the existing results). Corrections of already aggregated images are applied by the dashboard as soon as they are saved, so the scheduler doesn't have to look for them.
+
+To see results with other thresholds, change `DET_CONF_THRESHOLD` or `CLAS_CONF_THRESHOLD`, restart the service so that it uses them for new days, and run `--recompute-all`. It rebuilds every camera and day before today, including images moved out of the watch folder. A camera and day with deleted images is skipped with a warning in the log and keeps its results and thresholds; this doesn't count as a failure, so the exit code stays `0`.
 
 Settings (environment variables):
 
 * `DATABASE_URL`
 * `ANALYSIS_TZ`: timezone in which a day starts and ends (default `Asia/Colombo`); must match the dashboard's
 * `ANALYSIS_TIME`: local time of the nightly run (default `00:00`)
+* `DET_CONF_THRESHOLD`, `CLAS_CONF_THRESHOLD`: results of all detection and classification models below these confidence thresholds are left out (`0` to `1`, default `0`, which keeps all results); must match the dashboard's
 
 To run it once by hand with Docker, on the network of the `sentinel-rat` stack:
 
