@@ -12,6 +12,10 @@ Or run it once and exit, e.g. with ``docker run``::
 
     python -m sentinel_rat_pipeline.daily_analysis --once
     python -m sentinel_rat_pipeline.daily_analysis --date 2026-10-01 [--recompute]
+
+Or rebuild all past days, e.g. after DET_CONF_THRESHOLD or CLAS_CONF_THRESHOLD changed::
+
+    python -m sentinel_rat_pipeline.daily_analysis --recompute-all
 """
 
 from __future__ import annotations
@@ -72,6 +76,39 @@ def run_pending(engine: Engine, tz: str, today: date | None = None) -> bool:
     return all(results)
 
 
+def run_recompute_all(engine: Engine, tz: str, today: date | None = None) -> bool:
+    """Rebuild the results of every day before today (in tz) with the configured
+    thresholds. Return False if it failed. A camera and day that was skipped, since
+    some of its images were deleted, keeps its results and is not a failure."""
+    today = today or datetime.now(ZoneInfo(tz)).date()
+    try:
+        with Session(engine) as session:
+            result = daily_analysis_result_crud.recompute_all(
+                session,
+                today,
+                tz,
+                det_threshold=settings.det_conf_threshold,
+                clas_threshold=settings.clas_conf_threshold,
+            )
+    except Exception:
+        logger.exception("Recomputing the daily analysis failed")
+        return False
+
+    logger.info(
+        "Recomputed the daily analysis of %s camera(s) and day(s), skipped %s",
+        len(result.recomputed),
+        len(result.skipped),
+    )
+    for day, camera_id in result.skipped:
+        logger.warning(
+            "Daily analysis of %s for camera %s keeps its results and thresholds, "
+            "since some of its images were deleted",
+            day,
+            camera_id,
+        )
+    return True
+
+
 def next_run(now: datetime, at: time) -> datetime:
     """Return the first time `at` after `now`, in the timezone of `now`."""
     run = datetime.combine(now.date(), at, tzinfo=now.tzinfo)
@@ -118,6 +155,11 @@ def main(argv: list[str] | None = None) -> int:
         type=date.fromisoformat,
         help="aggregate one day (YYYY-MM-DD, in ANALYSIS_TZ), then exit",
     )
+    mode.add_argument(
+        "--recompute-all",
+        action="store_true",
+        help="rebuild all past days with the configured thresholds, then exit",
+    )
     parser.add_argument(
         "--recompute",
         action="store_true",
@@ -139,6 +181,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if run_day(engine, args.date, tz, recompute=args.recompute) else 1
     if args.once:
         return 0 if run_pending(engine, tz) else 1
+    if args.recompute_all:
+        return 0 if run_recompute_all(engine, tz) else 1
 
     # stop cleanly on `docker stop`
     stop = threading.Event()
