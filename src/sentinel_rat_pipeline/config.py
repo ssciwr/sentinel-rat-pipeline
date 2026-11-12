@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import time
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -28,6 +30,30 @@ class Settings(BaseSettings):
     force_delete_image_in_db: bool = Field(
         default=False, alias="FORCE_DELETE_IMAGE_IN_DB"
     )
+    # the daily analysis aggregates a day from midnight to midnight in this timezone
+    analysis_tz: str = Field(default="Asia/Colombo", alias="ANALYSIS_TZ")
+    # local time (in ANALYSIS_TZ) at which the scheduler runs the daily analysis
+    analysis_time: time = Field(default=time(0, 0), alias="ANALYSIS_TIME")
+    # the daily analysis leaves out results below these confidence thresholds,
+    # for all detection and classification models; 0 keeps all results
+    det_conf_threshold: float = Field(
+        default=0.0, ge=0, le=1, alias="DET_CONF_THRESHOLD"
+    )
+    clas_conf_threshold: float = Field(
+        default=0.0, ge=0, le=1, alias="CLAS_CONF_THRESHOLD"
+    )
+    # file that exists while the service is healthy, for the Docker healthcheck
+    # (see health.py); None writes no file
+    health_file: Path | None = Field(default=None, alias="HEALTH_FILE")
+
+    @field_validator("analysis_tz")
+    @classmethod
+    def _known_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"Unknown timezone: {value}") from exc
+        return value
 
 
 settings = Settings()

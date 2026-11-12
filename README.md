@@ -16,7 +16,7 @@ docker compose up --build
 
 The pipeline will watch `watched-images/` on the host and process new images automatically.
 
-No local installation is needed. The container is built from `python:3.13-slim` and installs the package with `pip install -e .`.
+No local installation is needed. The container is built from `python:3.13-slim` and installs the package with `uv sync --locked`, so it gets exactly the versions in `uv.lock`, including the commit of `sentinel-rat-dashboard`. To use a newer dashboard in the container, update the lock first (`uv lock --upgrade-package sentinel-rat-dashboard`), then rebuild.
 
 ## Run locally (optional)
 
@@ -119,4 +119,49 @@ When an image is removed from the watch folder, its `image_capture` row is kept:
 
 Rows already marked `moved` (e.g. by the service that moved the image, together with its `stored_path`) can be deleted from the DB if needed.
 
-With `FORCE_DELETE_IMAGE_IN_DB=true`, the row is deleted instead, together with its detections, classifications and corrections. TODO: how about the analysis results extracted from the image? Should they be kept for later reference, or updated accordingly?
+With `FORCE_DELETE_IMAGE_IN_DB=true`, the row is deleted instead, together with its detections, classifications and corrections. The daily analysis results of the image are kept for later reference, but its camera and day can't be rebuilt anymore (see the README of sentinel-rat-dashboard).
+
+## Daily analysis
+
+`sentinel_rat_pipeline.daily_analysis` aggregates the stored detections per day, camera and species into the `daily_analysis_result` table, using `compute_daily_results` of [sentinel-rat-dashboard](https://github.com/ssciwr/sentinel-rat-dashboard) (see its README for the aggregation rules). It runs as its own service (`daily-analysis` in `sentinel-rat/docker-compose.yml`) with the pipeline image, so it doesn't depend on the watcher.
+
+```bash
+# scheduler: aggregate every night at ANALYSIS_TIME, and once at startup
+python -m sentinel_rat_pipeline.daily_analysis
+# aggregate all past days that have images not aggregated yet, then exit
+python -m sentinel_rat_pipeline.daily_analysis --once
+# aggregate one day, then exit; --recompute rebuilds it from all its images
+python -m sentinel_rat_pipeline.daily_analysis --date 2026-10-01 --recompute
+# rebuild all past days with the configured thresholds, then exit
+python -m sentinel_rat_pipeline.daily_analysis --recompute-all
+```
+
+Each run aggregates every day before today that still has images not aggregated yet (`analyzed_at` is `NULL`): yesterday, days missed while the scheduler was not running, and days with images that arrived late (they are merged into the existing results). Corrections of already aggregated images are applied by the CRUD of corresponding tables in `sentinel-rat-dashboard` as soon as they are saved, so the scheduler doesn't have to look for them.
+
+To see results with other thresholds, change `DET_CONF_THRESHOLD` or `CLAS_CONF_THRESHOLD`, restart the service so that it uses them for new days, and run `--recompute-all`. It rebuilds every camera and day before today, including images moved out of the watch folder. A camera and day with deleted images is skipped with a warning in `daily_analysis_warning` attribute of `DetectionCorrection` and `ClassificationCorrection` of `sentinel-rat-dashboard`, and keeps its results and thresholds; this doesn't count as a failure, so the exit code stays `0`.
+
+Settings (environment variables):
+
+* `DATABASE_URL`
+* `ANALYSIS_TZ`: timezone in which a day starts and ends (default `Asia/Colombo`); must match the dashboard's
+* `ANALYSIS_TIME`: local time of the nightly run (default `00:00`)
+* `DET_CONF_THRESHOLD`, `CLAS_CONF_THRESHOLD`: results of all detection and classification models below these confidence thresholds are left out (`0` to `1`, default `0`, which keeps all results); must match the values used in `sentinel-rat-dashboard`'s
+* `HEALTH_FILE`: see [Health file](#health-file)
+
+## Health file
+
+With `HEALTH_FILE` set to a path, the watcher and the daily analysis scheduler report their health for the Docker healthcheck (see `health.py`): the file exists while the service is healthy. Without it (the default), no file is written.
+
+* Watcher (`sentinel_rat_pipeline.main`): healthy while the watchdog observer runs, from its start on, so also while the backlog of images at startup is processed. If its thread dies, the process keeps running but no image is processed anymore, so the file is removed and an error is logged.
+* Daily analysis scheduler: healthy while its last run (the catch-up at startup or the nightly run) succeeded. A failed run removes the file until a later run succeeds. `--once`, `--date` and `--recompute-all` don't write it.
+
+The file is removed at startup, so a file left from before a restart of the container doesn't count. `sentinel-rat/docker-compose.yml` sets `HEALTH_FILE=/tmp/healthy` for both services and checks it with `test -f /tmp/healthy`.
+
+To run it once by hand with Docker, on the network of the `sentinel-rat` stack:
+
+```bash
+docker run --rm --network sentinel-rat_sentinel-rat-net \
+  -e DATABASE_URL=postgresql+psycopg://sentinel_user:sentinel_pass@db:5432/sentinel_db \
+  -e ANALYSIS_TZ=Asia/Colombo \
+  sentinel-rat-pipeline:local python -m sentinel_rat_pipeline.daily_analysis --once
+```

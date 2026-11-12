@@ -8,6 +8,7 @@ from unittest.mock import ANY, MagicMock
 
 import pytest
 
+from sentinel_rat_pipeline import health
 from sentinel_rat_pipeline.config import Settings
 from sentinel_rat_pipeline.scripts import watch_inputs
 from sentinel_rat_pipeline.scripts.watch_inputs import (
@@ -64,6 +65,9 @@ class FakeObserver:
     def join(self) -> None:
         self.joined = True
 
+    def is_alive(self) -> bool:
+        return self.started and not self.stopped
+
 
 @pytest.fixture
 def fake_observer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeObserver:
@@ -88,6 +92,52 @@ def _stop_watch_on_sleep(
     monkeypatch.setattr(
         watch_inputs, "time", SimpleNamespace(sleep=sleep, monotonic=time.monotonic)
     )
+
+
+def _use_health_file(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
+    monkeypatch.setattr(health, "settings", Settings(health_file=path))
+
+
+def test_start_watch_is_healthy_while_the_observer_runs(
+    fake_observer: FakeObserver, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    health_file = tmp_path.parent / f"{tmp_path.name}-healthy"
+    health_file.touch()  # left over from before a restart of the container
+    _use_health_file(monkeypatch, health_file)
+    at_start: list[bool] = []
+    start = fake_observer.start
+
+    def start_and_record() -> None:
+        at_start.append(health_file.exists())
+        start()
+
+    fake_observer.start = start_and_record
+    in_loop: list[bool] = []
+    _stop_watch_on_sleep(monkeypatch, lambda: in_loop.append(health_file.exists()))
+
+    watch_inputs.start_watch(lambda batch: None)
+
+    assert at_start == [False]  # the old file was removed
+    assert in_loop == [True]
+    assert not health_file.exists()  # stopped
+
+
+def test_start_watch_is_unhealthy_when_the_observer_died(
+    fake_observer: FakeObserver,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    health_file = tmp_path.parent / f"{tmp_path.name}-healthy"
+    _use_health_file(monkeypatch, health_file)
+    fake_observer.is_alive = lambda: False
+    in_loop: list[bool] = []
+    _stop_watch_on_sleep(monkeypatch, lambda: in_loop.append(health_file.exists()))
+
+    watch_inputs.start_watch(lambda batch: None)
+
+    assert in_loop == [False]
+    assert "watchdog observer stopped" in caplog.text
 
 
 def test_list_images_empty(tmp_path: Path) -> None:
@@ -539,3 +589,21 @@ def test_start_watch_processes_backlog_after_observer_started(
         ANY, backlog_filter, str(tmp_path.resolve())
     )
     assert isinstance(mock_backlog.call_args.args[0], ImageBatcher)
+
+
+def test_start_watch_is_healthy_while_processing_the_backlog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_observer: FakeObserver
+) -> None:
+    health_file = tmp_path.parent / f"{tmp_path.name}-healthy"
+    _use_health_file(monkeypatch, health_file)
+    during_backlog: list[bool] = []
+    monkeypatch.setattr(
+        watch_inputs,
+        "queue_backlog",
+        lambda *_: during_backlog.append(health_file.exists()),
+    )
+    _stop_watch_on_sleep(monkeypatch)
+
+    watch_inputs.start_watch(MagicMock(), process_backlog=True)
+
+    assert during_backlog == [True]
