@@ -16,7 +16,7 @@ docker compose up --build
 
 The pipeline will watch `watched-images/` on the host and process new images automatically.
 
-No local installation is needed. The container is built from `python:3.13-slim` and installs the package with `pip install -e .`.
+No local installation is needed. The container is built from `python:3.13-slim` and installs the package with `uv sync --locked`, so it gets exactly the versions in `uv.lock`, including the commit of `sentinel-rat-dashboard`. To use a newer dashboard in the container, update the lock first (`uv lock --upgrade-package sentinel-rat-dashboard`), then rebuild.
 
 ## Run locally (optional)
 
