@@ -58,9 +58,65 @@ def test_run_scheduler_catches_up_then_stops(monkeypatch: pytest.MonkeyPatch) ->
     run_pending.assert_called_once()
 
 
+class _RecordingStop:
+    """Stop event that records the wait timeout and stops after `waits` waits."""
+
+    def __init__(self, waits: int = 1) -> None:
+        self.timeouts: list[float] = []
+        self.waits = waits
+
+    def wait(self, timeout: float) -> bool:
+        self.timeouts.append(timeout)
+        return len(self.timeouts) >= self.waits
+
+
+def _freeze_now(monkeypatch: pytest.MonkeyPatch, now: datetime) -> None:
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            return now.astimezone(tz)
+
+    monkeypatch.setattr(daily_analysis, "datetime", FrozenDatetime)
+
+
+@pytest.mark.parametrize(
+    ("now", "expected_hours"),
+    [
+        # clocks go forward at 02:00 on 2026-03-29: noon to 03:00 is 14 real hours
+        (datetime(2026, 3, 28, 12, 0, tzinfo=ZoneInfo("Europe/Amsterdam")), 14),
+        # clocks go back at 03:00 on 2026-10-25: noon to 03:00 is 16 real hours
+        (datetime(2026, 10, 24, 12, 0, tzinfo=ZoneInfo("Europe/Amsterdam")), 16),
+    ],
+)
+def test_run_scheduler_waits_real_time_across_dst(
+    monkeypatch: pytest.MonkeyPatch, now: datetime, expected_hours: int
+) -> None:
+    monkeypatch.setattr(daily_analysis, "run_pending", MagicMock())
+    _freeze_now(monkeypatch, now)
+    stop = _RecordingStop()
+
+    daily_analysis.run_scheduler(MagicMock(), "Europe/Amsterdam", time(3, 0), stop)
+
+    assert stop.timeouts == [expected_hours * 3600]
+
+
+def test_run_scheduler_survives_run_pending_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_pending = MagicMock(side_effect=RuntimeError("boom"))
+    monkeypatch.setattr(daily_analysis, "run_pending", run_pending)
+    stop = _RecordingStop(waits=2)
+
+    daily_analysis.run_scheduler(MagicMock(), TZ, time(0, 0), stop)
+
+    # the catch-up run and the first scheduled run both failed, yet it kept going
+    assert run_pending.call_count == 2
+    assert len(stop.timeouts) == 2
+
+
 def test_run_day_reports_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     crud = MagicMock()
-    crud.compute_daily_results.side_effect = ValueError("several detection models")
+    crud.compute_daily_results.side_effect = ValueError("unrecognized detection model")
     monkeypatch.setattr(daily_analysis, "daily_analysis_result_crud", crud)
     monkeypatch.setattr(daily_analysis, "Session", MagicMock())
 
@@ -317,7 +373,9 @@ def test_run_recompute_all_applies_new_thresholds(
     yesterday, today = date(2026, 10, 1), date(2026, 10, 2)
     _seed(engine)
     with Session(engine) as session, session.begin():
-        _add_image(session, _local(yesterday, 10), "CAM01_a.jpg")  # confidence 0.8
+        _add_image(
+            session, _local(yesterday, 10), "CAM01_a.jpg"
+        )  # classification confidence 0.8
 
     _use_thresholds(monkeypatch, 0.5)
     assert daily_analysis.run_pending(engine, TZ, today=today) is True

@@ -125,15 +125,24 @@ def run_scheduler(
     stop = stop or threading.Event()
     zone = ZoneInfo(tz)
 
-    run_pending(engine, tz)
+    def run_pending_safely() -> None:
+        # an unexpected error must not kill the scheduler; retry at the next run
+        try:
+            run_pending(engine, tz)
+        except Exception:
+            logger.exception("Daily analysis run failed")
+
+    run_pending_safely()
     while True:
         now = datetime.now(zone)
         run = next_run(now, at)
         logger.info("Next daily analysis at %s", run.isoformat())
-        if stop.wait((run - now).total_seconds()):
+        # compare timestamps: subtracting datetimes of the same zone ignores a
+        # DST change between them, which would make the wait an hour off
+        if stop.wait(run.timestamp() - now.timestamp()):
             logger.info("Daily analysis scheduler stopped")
             return
-        run_pending(engine, tz)
+        run_pending_safely()
 
 
 def main(argv: list[str] | None = None) -> int:
