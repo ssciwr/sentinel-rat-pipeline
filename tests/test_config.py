@@ -13,6 +13,11 @@ def test_batch_defaults() -> None:
     assert settings.batch_window_seconds == 60.0
     assert settings.max_batch_size == 50
     assert settings.process_backlog is True
+    assert settings.force_delete_image_in_db is False
+    assert settings.analysis_tz == "Asia/Colombo"
+    assert settings.analysis_time == time(0, 0)
+    assert settings.det_conf_threshold == 0.0
+    assert settings.clas_conf_threshold == 0.0
 
 
 def test_force_delete_image_in_db_defaults_to_false(
