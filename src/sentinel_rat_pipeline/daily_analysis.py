@@ -182,7 +182,9 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("DATABASE_URL is not set")
         return 1
 
-    engine = create_engine(settings.database_url)
+    # pre-ping replaces pooled connections that died between the daily runs,
+    # e.g. after a DB restart, instead of failing the run
+    engine = create_engine(settings.database_url, pool_pre_ping=True)
     tz = settings.analysis_tz
     logger.info("Daily analysis in timezone %s", tz)
 
