@@ -146,6 +146,16 @@ Settings (environment variables):
 * `ANALYSIS_TZ`: timezone in which a day starts and ends (default `Asia/Colombo`); must match the dashboard's
 * `ANALYSIS_TIME`: local time of the nightly run (default `00:00`)
 * `DET_CONF_THRESHOLD`, `CLAS_CONF_THRESHOLD`: results of all detection and classification models below these confidence thresholds are left out (`0` to `1`, default `0`, which keeps all results); must match the values used in `sentinel-rat-dashboard`'s
+* `HEALTH_FILE`: see [Health file](#health-file)
+
+## Health file
+
+With `HEALTH_FILE` set to a path, the watcher and the daily analysis scheduler report their health for the Docker healthcheck (see `health.py`): the file exists while the service is healthy. Without it (the default), no file is written.
+
+* Watcher (`sentinel_rat_pipeline.main`): healthy while the watchdog observer runs, from its start on, so also while the backlog of images at startup is processed. If its thread dies, the process keeps running but no image is processed anymore, so the file is removed and an error is logged.
+* Daily analysis scheduler: healthy while its last run (the catch-up at startup or the nightly run) succeeded. A failed run removes the file until a later run succeeds. `--once`, `--date` and `--recompute-all` don't write it.
+
+The file is removed at startup, so a file left from before a restart of the container doesn't count. `sentinel-rat/docker-compose.yml` sets `HEALTH_FILE=/tmp/healthy` for both services and checks it with `test -f /tmp/healthy`.
 
 To run it once by hand with Docker, on the network of the `sentinel-rat` stack:
 

@@ -13,6 +13,7 @@ from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
 from sentinel_rat_pipeline.config import settings
+from sentinel_rat_pipeline.health import report_healthy
 
 logger = logging.getLogger(__name__)
 
@@ -287,6 +288,9 @@ def start_watch(
     after the observer has started (see ``queue_backlog``).
     """
 
+    # not healthy until the observer runs, also after a restart of the container,
+    # which keeps the health file of the previous run
+    report_healthy(False)
     folder = Path(settings.watch_folder).resolve()
     folder.mkdir(parents=True, exist_ok=True)
 
@@ -315,12 +319,23 @@ def start_watch(
         raise
 
     logger.info("Watching %s", folder)
+    # healthy from now on: new images are queued while the backlog, which can
+    # take long after a downtime, is processed
+    report_healthy(True)
     if process_backlog:
         queue_backlog(batcher, backlog_filter, str(folder))
+    alive = True
     try:
         while True:
+            # the observer thread does the work: if it died, the process still
+            # runs but no image is processed anymore, so report it as unhealthy
+            was_alive, alive = alive, observer.is_alive()
+            if was_alive and not alive:
+                logger.error("The watchdog observer stopped, no images are processed")
+            report_healthy(alive)
             time.sleep(poll_interval)
     except KeyboardInterrupt:
+        report_healthy(False)
         observer.stop()
     observer.join()
     batcher.flush()

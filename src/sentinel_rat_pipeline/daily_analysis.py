@@ -33,6 +33,7 @@ from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import Session
 
 from sentinel_rat_pipeline.config import settings
+from sentinel_rat_pipeline.health import report_healthy
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -128,10 +129,17 @@ def run_scheduler(
     def run_pending_safely() -> None:
         # an unexpected error must not kill the scheduler; retry at the next run
         try:
-            run_pending(engine, tz)
+            ok = run_pending(engine, tz)
         except Exception:
             logger.exception("Daily analysis run failed")
+            ok = False
+        # healthy while the last run succeeded, so a failing run shows up in
+        # `docker ps`, not only in the logs
+        report_healthy(ok)
 
+    # not healthy before the first run, also after a restart of the container,
+    # which keeps the health file of the previous run
+    report_healthy(False)
     run_pending_safely()
     while True:
         now = datetime.now(zone)
@@ -141,6 +149,7 @@ def run_scheduler(
         # DST change between them, which would make the wait an hour off
         if stop.wait(run.timestamp() - now.timestamp()):
             logger.info("Daily analysis scheduler stopped")
+            report_healthy(False)
             return
         run_pending_safely()
 

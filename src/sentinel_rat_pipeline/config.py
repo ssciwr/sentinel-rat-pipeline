@@ -42,6 +42,9 @@ class Settings(BaseSettings):
     clas_conf_threshold: float = Field(
         default=0.0, ge=0, le=1, alias="CLAS_CONF_THRESHOLD"
     )
+    # file that exists while the service is healthy, for the Docker healthcheck
+    # (see health.py); None writes no file
+    health_file: Path | None = Field(default=None, alias="HEALTH_FILE")
 
     @field_validator("analysis_tz")
     @classmethod

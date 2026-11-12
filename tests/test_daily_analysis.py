@@ -2,6 +2,7 @@
 
 import threading
 from datetime import date, datetime, time
+from pathlib import Path
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
@@ -19,7 +20,7 @@ from dashboard.db.data_model import (
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session
 
-from sentinel_rat_pipeline import daily_analysis
+from sentinel_rat_pipeline import daily_analysis, health
 from sentinel_rat_pipeline.config import Settings
 
 TZ = "Asia/Colombo"
@@ -112,6 +113,57 @@ def test_run_scheduler_survives_run_pending_errors(
     # the catch-up run and the first scheduled run both failed, yet it kept going
     assert run_pending.call_count == 2
     assert len(stop.timeouts) == 2
+
+
+class _HealthRecordingStop(_RecordingStop):
+    """Stop event that also records whether the health file exists while waiting."""
+
+    def __init__(self, health_file: Path, waits: int = 1) -> None:
+        super().__init__(waits)
+        self.health_file = health_file
+        self.healthy: list[bool] = []
+
+    def wait(self, timeout: float) -> bool:
+        self.healthy.append(self.health_file.exists())
+        return super().wait(timeout)
+
+
+@pytest.mark.parametrize(
+    ("run_pending", "healthy"),
+    [
+        (MagicMock(return_value=True), True),
+        (MagicMock(return_value=False), False),  # a day failed
+        (MagicMock(side_effect=RuntimeError("boom")), False),
+    ],
+)
+def test_run_scheduler_is_healthy_while_the_last_run_succeeded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, run_pending, healthy: bool
+) -> None:
+    health_file = tmp_path / "healthy"
+    health_file.touch()  # left over from before a restart of the container
+    monkeypatch.setattr(health, "settings", Settings(health_file=health_file))
+    monkeypatch.setattr(daily_analysis, "run_pending", run_pending)
+    stop = _HealthRecordingStop(health_file)
+
+    daily_analysis.run_scheduler(MagicMock(), TZ, time(0, 0), stop)
+
+    assert stop.healthy == [healthy]
+    assert not health_file.exists()  # stopped
+
+
+def test_run_scheduler_recovers_health_after_a_failed_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    health_file = tmp_path / "healthy"
+    monkeypatch.setattr(health, "settings", Settings(health_file=health_file))
+    monkeypatch.setattr(
+        daily_analysis, "run_pending", MagicMock(side_effect=[False, True])
+    )
+    stop = _HealthRecordingStop(health_file, waits=2)
+
+    daily_analysis.run_scheduler(MagicMock(), TZ, time(0, 0), stop)
+
+    assert stop.healthy == [False, True]
 
 
 def test_run_day_reports_failure(monkeypatch: pytest.MonkeyPatch) -> None:
