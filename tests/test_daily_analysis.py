@@ -1,5 +1,7 @@
 """Tests for the daily analysis scheduler."""
 
+import runpy
+import sys
 import threading
 from datetime import date, datetime, time
 from pathlib import Path
@@ -20,7 +22,7 @@ from dashboard.db.data_model import (
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session
 
-from sentinel_rat_pipeline import daily_analysis, health
+from sentinel_rat_pipeline import config, daily_analysis, health
 from sentinel_rat_pipeline.config import Settings
 
 TZ = "Asia/Colombo"
@@ -305,6 +307,57 @@ def test_main_requires_database_url(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(daily_analysis, "settings", Settings(database_url=""))
 
     assert daily_analysis.main(["--once"]) == 1
+
+
+def test_run_pending_reports_failed_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    crud = MagicMock()
+    crud.pending_days.side_effect = ValueError("database is gone")
+    monkeypatch.setattr(daily_analysis, "daily_analysis_result_crud", crud)
+    monkeypatch.setattr(daily_analysis, "Session", MagicMock())
+    run_day = MagicMock()
+    monkeypatch.setattr(daily_analysis, "run_day", run_day)
+
+    assert daily_analysis.run_pending(MagicMock(), TZ, today=date(2026, 10, 2)) is False
+
+    run_day.assert_not_called()
+
+
+def test_main_without_mode_runs_scheduler_until_sigterm(
+    cli, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_day, run_pending = cli
+    run_scheduler = MagicMock()
+    monkeypatch.setattr(daily_analysis, "run_scheduler", run_scheduler)
+    signal_mock = MagicMock()
+    monkeypatch.setattr(daily_analysis.signal, "signal", signal_mock)
+
+    assert daily_analysis.main([]) == 0
+
+    run_scheduler.assert_called_once()
+    _, tz, at, stop = run_scheduler.call_args.args
+    assert (tz, at) == (TZ, time(0, 0))
+    run_day.assert_not_called()
+    run_pending.assert_not_called()
+
+    # `docker stop` sends SIGTERM, whose handler stops the scheduler
+    signum, handler = signal_mock.call_args.args
+    assert signum == daily_analysis.signal.SIGTERM
+    assert not stop.is_set()
+    handler(signum, None)
+    assert stop.is_set()
+
+
+def test_module_exits_with_the_code_of_main(monkeypatch: pytest.MonkeyPatch) -> None:
+    # run as `python -m`, without DATABASE_URL, so main returns 1 before any work
+    monkeypatch.setattr(config, "settings", Settings(database_url=""))
+    monkeypatch.setattr(sys, "argv", ["daily_analysis", "--once"])
+    # executed fresh, as in `python -m`, not on top of the imported module
+    monkeypatch.delitem(sys.modules, daily_analysis.__name__)
+
+    with pytest.raises(SystemExit) as exit_info:
+        runpy.run_module(daily_analysis.__name__, run_name="__main__")
+
+    assert exit_info.value.code == 1
 
 
 # --- integration test against a real PostGIS database ---
